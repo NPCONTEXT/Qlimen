@@ -1,3 +1,7 @@
+![Qlimen 封面](docs/cover.png)
+
+<sub>封面图由 GPT-image-2 生成。</sub>
+
 # Qlimen
 
 给 AI 编程代理用的**工作协议 + 安全底座**。一份核心协议，同时接进 Claude Code、Codex、DeepSeek Harness，让不同的模型按同一套规矩干活：先调研、写方案、等批准；进度落在文件里，换会话也能接着干；没验证的就说没验证。
@@ -249,7 +253,7 @@ adapters/                   Claude Code、Codex、DSH、kimi-code 怎么接
 examples/                   私有协议示例、任务目录三件套样例、工人回执样例（都已脱敏）
 tests/                      不调模型的自动测试
 tools/统计/                 用你自己的会话记录复现实测指标的脚本
-docs/                       架构、设计取舍、实测记录、协议来历
+docs/                       架构、设计取舍、实测记录、协议来历、封面图
 archive/                    瘦身时砍下来的部件：流程 skill、5 本作业手册、验收和收尾钩子
 install.sh                  安装脚本（默认只预演）
 ```
