@@ -1,0 +1,1153 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""waibao：把任务派给 dsh / kimi 的无头工人（Qlimen core/workers）。
+
+  waibao flash --dir <目录> --tag <标签> --plan "<一句话：操作、成本、规划>" --task "<任务>"
+  waibao k3|k28 --dir <目录> --tag <标签> --plan "..." --task-file 任务.txt
+  waibao k3|k28 --web --tag <标签> --plan "..." --task "<任务>"   联网工人：只能搜索和读网页，读不了本地文件
+  waibao k3|k28 --dir <目录> --out <目录里的结果文件夹> --timeout 秒 ...   能写文件的工人：只能写进结果文件夹
+  echo "<任务>" | waibao flash --dir <目录> --tag <标签> --plan "..."
+  waibao --status
+  waibao apply --dir <根目录> --list 清单.json [--dry-run]   照工人出的操作清单执行（只有 mkdir/move/rename）
+  waibao undo <撤销记录.json>                               按撤销记录反向恢复（先按 apply 的规矩整份预审）
+
+模型：flash 走 dsh（沙箱只读，补丁关掉命令行和联网）；k3 / k28 走 kimi（工具白名单：默认本地只读，--web 换成只联网，
+--out 换成读本地 + 只写结果文件夹，写入另由系统沙箱限定在那个文件夹）。
+读本地文件的工人不给联网，联网的工人不给读本地文件；工人用了名单以外的工具当场中止，读过的工作目录以外的路径列在回执里。
+预算只记账和提醒，不拦（2026-10-09 用户定）：日上限、超长上限（不给 --timeout 时的时限）超了只在派工前和回执里提醒。
+预算、价目、目录范围、外壳与账本路径都在同目录 预算.json。退出码：0 完成，2 被拒绝，3 失败/超时/越界。
+只依赖系统自带的 Python 3.9 标准库。
+"""
+import argparse
+import csv
+import datetime
+import fcntl
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import stat
+import time
+import unicodedata
+import uuid
+
+BASE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+
+
+def _p(x):
+    return os.path.expanduser(x)
+
+
+with open(os.path.join(BASE, "预算.json"), encoding="utf-8") as _f:
+    _CFG = json.load(_f)
+# 以下环境变量只用于不花钱的自查（替换成假工人、临时账本），正常使用不要设置。
+DSH = os.environ.get("WAIBAO_DSH", _p(_CFG["shells"]["dsh"]))
+KIMI = os.environ.get("WAIBAO_KIMI", _p(_CFG["shells"]["kimi"]))
+DSH_PATCH = _p(_CFG["dsh_patch"])
+LEDGER = os.environ.get("WAIBAO_LEDGER", _p(_CFG["ledger"]))
+OUT = os.environ.get("WAIBAO_OUT", _p(_CFG["results_dir"]))
+KIMI_SESSIONS = os.environ.get("WAIBAO_KIMI_SESSIONS", _p(_CFG["kimi_sessions"]))
+# 工人数据目录（见 预算.json worker_homes）：放在会话工作区内，workspace-write 下也能写。
+_HOMES = _CFG.get("worker_homes", {})
+WORKER_ENV = {k: _p(_HOMES[n]) for k, n in (("DSH_HOME", "dsh"), ("KIMI_CODE_HOME", "kimi")) if n in _HOMES}
+
+MODELS = {
+    "flash": {"shell": "dsh"},
+    "k3": {"shell": "kimi", "alias": "kimi-code/k3"},
+    "k28": {"shell": "kimi", "alias": "kimi-code/kimi-for-coding"},
+}
+# 工人档案：每种工人该有哪些工具。读本地文件的不给联网，联网的不给读本地文件。
+# 工人调用了名单以外的工具，说明补丁或白名单没生效，当场中止（见 _alarm）。
+PROFILES = {
+    "dsh": {"name": "本地只读", "rules": "工人守则.md", "tools": ("read", "read_image", "glob", "grep")},
+    "kimi": {"name": "本地只读", "rules": "工人守则.md", "agent": "工人-kimi.md",
+             "tools": ("Read", "Grep", "Glob", "ReadMediaFile")},
+    "kimi-web": {"name": "联网", "rules": "工人守则-联网.md", "agent": "工人-kimi-联网.md",
+                 "tools": ("WebSearch", "FetchURL")},
+    "kimi-write": {"name": "本地读写（只写结果文件夹）", "rules": "工人守则-写.md", "agent": "工人-kimi-写.md",
+                   "tools": ("Read", "Grep", "Glob", "ReadMediaFile", "Write")},
+}
+WRITE_TOOLS = ("Write",)
+SANDBOX = "/usr/bin/sandbox-exec"
+# 联网工人的工作目录：一个专用的空目录，在派工范围内、不在禁区里。
+WEB_DIR = os.path.join(os.path.dirname(BASE), "联网工作目录.nosync")
+WEB_HINT = re.compile(r"联网|搜索|网上|官网|https?://")
+FIELDS =["id", "日期", "开始时间", "模型", "壳", "标签", "目录", "状态", "耗时秒",
+          "输入未缓存", "输入缓存", "输出", "估算花费元", "pid", "说明", "结果文件"]
+RECEIPT_LINES = 40
+
+
+class Refused(Exception):
+    pass
+
+
+def load_cfg():
+    return _CFG
+
+
+# ---------- 账本 ----------
+
+class Locked(object):
+    """所有会话共用一个账本，读写都在文件锁里做。"""
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+        self.f = open(LEDGER + ".lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def read_rows():
+    if not os.path.exists(LEDGER):
+        return []
+    with open(LEDGER, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_rows(rows):
+    tmp = LEDGER + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, LEDGER)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def sweep(rows):
+    """调度进程已不在却还标着运行中的行，改成中断；预留的花费保留，宁可多算。"""
+    for r in rows:
+        if r["状态"] == "运行中" and not pid_alive(r["pid"]):
+            r["状态"] = "中断"
+
+
+def today_totals(rows, today):
+    """返回（今天 DeepSeek 估算花费，{kimi 模型: 今天次数}）。"""
+    spent = sum(float(r["估算花费元"] or 0) for r in rows if r["日期"] == today and r["壳"] == "dsh")
+    calls = {}
+    for r in rows:
+        if r["日期"] == today and r["壳"] == "kimi":
+            calls[r["模型"]] = calls.get(r["模型"], 0) + 1
+    return spent, calls
+
+
+def check_budget(model, cfg, rows, today):
+    """派工前看日上限：到了就返回一句提醒，没到返回空串。只提醒，不拦（2026-10-09 用户定）。"""
+    spent, calls = today_totals(rows, today)
+    if MODELS[model]["shell"] == "dsh":
+        daily = float(cfg["deepseek_daily_cny"])
+        if spent >= daily - 1e-9:
+            return "⚠ 今天 DeepSeek 已计 ¥%.2f，已到日上限 ¥%.2f（只提醒，没拦）" % (spent, daily)
+        return ""
+    limit = int(cfg["kimi_daily_calls"][model])
+    n = calls.get(model, 0)
+    if n + 1 > limit:
+        return "⚠ 这是今天第 %d 次 %s，超过日上限 %d 次（只提醒，没拦）" % (n + 1, model, limit)
+    return ""
+
+
+def today_line(model, cfg, spent, calls):
+    """回执里的「今日用量」，超了日上限带一句提醒。"""
+    if MODELS[model]["shell"] == "dsh":
+        daily = float(cfg["deepseek_daily_cny"])
+        over = spent > daily + 1e-9
+        return "今日 DeepSeek ¥%.2f / ¥%.2f%s" % (spent, daily, "  ⚠ 超过日上限（只提醒）" if over else "")
+    limit, n = int(cfg["kimi_daily_calls"][model]), calls.get(model, 0)
+    return "今日 %s %d / %d 次%s" % (model, n, limit, "  ⚠ 超过日上限（只提醒）" if n > limit else "")
+
+
+def reserve(model, cfg, meta):
+    """账本里先记一行「运行中」，返回日上限提醒（没到上限是空串）。"""
+    today = meta["日期"]
+    with Locked():
+        rows = read_rows()
+        sweep(rows)
+        warn = check_budget(model, cfg, rows, today)
+        row = dict((k, "") for k in FIELDS)
+        row.update(meta)
+        row.update({"状态": "运行中", "估算花费元": "0.0000", "pid": str(os.getpid())})
+        rows.append(row)
+        write_rows(rows)
+    return warn
+
+
+def settle(rid, upd):
+    with Locked():
+        rows = read_rows()
+        for r in rows:
+            if r["id"] == rid:
+                r.update(upd)
+        write_rows(rows)
+        return today_totals(rows, datetime.date.today().isoformat())
+
+
+# ---------- 目录检查 ----------
+
+def _real(p):
+    return os.path.realpath(os.path.expanduser(p))
+
+
+def _inside(p, root):
+    return p == root or p.startswith(root + os.sep)
+
+
+def check_dir(d, cfg):
+    real = _real(d)
+    if not os.path.isdir(real):
+        raise Refused("目录不存在：%s" % d)
+    for root in cfg["deny_roots"]:
+        root = _real(root)
+        if _inside(real, root):
+            raise Refused("该目录在禁区内，不派工。")
+        if _inside(root, real):
+            raise Refused("该目录下面包含禁区，请指定更具体的子目录。")
+    if not any(_inside(real, _real(r)) for r in cfg["allow_roots"]):
+        raise Refused("该目录不在允许外发的范围内（见 预算.json 的 allow_roots）。")
+    return real
+
+
+# ---------- 跑工人 ----------
+
+def cost_of(model, cfg, u):
+    p = cfg["prices_cny_per_mtok"].get(model)
+    if not p:
+        return 0.0
+    return (u["in"] * p["in"] + u["cache"] * p["cache"] + u["out"] * p["out"]) / 1e6
+
+
+def _spawn(cmd, cwd, env, errf, stdin):
+    return subprocess.Popen(cmd, cwd=cwd, env=env, stdin=stdin, stdout=subprocess.PIPE, stderr=errf,
+                            universal_newlines=True, encoding="utf-8", errors="replace",
+                            start_new_session=True)
+
+
+def _killer(proc, flag):
+    def kill(why):
+        flag.setdefault("why", why)       # 先到先得：越界、超时、中断谁先发生就记谁
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return kill
+
+
+def _calls(ev):
+    """一行事件里的工具调用：[(工具名, 参数)]。两种壳的格式都认；参数解不出来给 None。"""
+    out = []
+    if not isinstance(ev, dict):
+        return out
+    if ev.get("type") == "tool_call":                        # dsh
+        out.append((ev.get("tool"), ev.get("input")))
+    tcs = ev.get("tool_calls")                               # kimi
+    for tc in tcs if isinstance(tcs, list) else []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        fn = fn if isinstance(fn, dict) else {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = None
+        out.append((fn.get("name"), args))
+    return out
+
+
+def _write_ok(name, args, cwd, out):
+    """写文件的调用是不是落在结果文件夹里；判不出路径也算不是。"""
+    if not out:
+        return False
+    paths = _targets(name, args)
+    if not paths:
+        return False
+    for p in paths:
+        if "\x00" in p:
+            return False
+        full = os.path.expanduser(p)
+        if not os.path.isabs(full):
+            full = os.path.join(cwd or "/", full)
+        if not _inside(_key(os.path.realpath(full)), _key(out)):
+            return False
+    return True
+
+
+def _alarm(ev, allowed, kill, flag, cwd=None, out=None):
+    """工人用了名单以外的工具、或往结果文件夹以外写，就当场中止。自己出错只记一笔，不拖累读输出的循环。"""
+    try:
+        bad = []
+        for n, args in _calls(ev):
+            if n not in allowed:
+                bad.append(str(n))
+            elif n in WRITE_TOOLS and not _write_ok(n, args, cwd, out):
+                bad.append("%s（写到结果文件夹以外，或判不出写到哪）" % n)
+        if bad:                                              # 同一条消息里的全部记下再杀
+            flag.setdefault("bad", []).extend(bad)
+            kill("越界")
+    except Exception as e:
+        flag.setdefault("notes", []).append("工具报警出错：%r" % (e,))
+
+
+def sandbox_profile(out):
+    """系统沙箱规则（sandbox-exec）：写入只放行结果文件夹、kimi 工人数据目录、临时目录和 /dev，别处一律挡掉。"""
+    allow = [out, WORKER_ENV.get("KIMI_CODE_HOME"), "/private/tmp", "/private/var/folders", "/dev"]
+
+    def q(p):
+        return '"%s"' % p.replace("\\", "\\\\").replace('"', '\\"')
+    subs = " ".join("(subpath %s)" % q(os.path.realpath(p)) for p in allow if p)
+    return "(version 1)(allow default)(deny file-write*)(allow file-write* %s)" % subs
+
+
+def _read_failed(kill, err, e):
+    """读工人输出时出了没料到的错：杀掉工人（状态先到先得），把错记下来，由调用方照常收尾。
+    工人是另起会话启动的，不杀就没人管；已经拿到的回答和用量照样交出去。"""
+    kill("中断")
+    return "；".join(x for x in (err, "读工人输出时出错：%r" % (e,)) if x)
+
+
+def run_dsh(model, cfg, cwd, text, rawpath, timeout, prof):
+    cmd = [DSH, "headless", "--patch", DSH_PATCH, "--json", "-"]
+    env = dict(os.environ, DSH_PERMISSION_MODE="read-only", **WORKER_ENV)
+    u = {"in": 0, "cache": 0, "out": 0}
+    final, err, flag = None, None, {}
+    with open(rawpath, "w", encoding="utf-8") as raw, open(rawpath + ".err", "w") as errf:
+        p = _spawn(cmd, cwd, env, errf, subprocess.PIPE)
+        kill = _killer(p, flag)
+        timer = threading.Timer(timeout, kill, ["超时"])
+        timer.start()
+        try:
+            try:
+                p.stdin.write(text)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            for line in p.stdout:
+                raw.write(line)
+                raw.flush()
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                _alarm(ev, prof["tools"], kill, flag)
+                t = ev.get("type")
+                if t == "status" and ev.get("phase") == "step_end" and isinstance(ev.get("usage"), dict):
+                    g = ev["usage"]
+                    u["in"] += int(g.get("inputTokens") or 0) + int(g.get("cacheWriteTokens") or 0)
+                    u["cache"] += int(g.get("cacheReadTokens") or 0)
+                    u["out"] += int(g.get("outputTokens") or 0)
+                elif t == "status" and ev.get("phase") == "turn_end":
+                    reason = ev.get("reason") or {}
+                    if reason.get("kind") == "error":
+                        err = (reason.get("error") or {}).get("message") or "未知错误"
+                elif t == "final":
+                    final = ev.get("text")
+        except Exception as e:
+            err = _read_failed(kill, err, e)
+        except BaseException:                 # 被打断（如 Ctrl-C）：不要结果，但不能留下工人
+            kill("中断")
+            p.wait()
+            raise
+        finally:
+            timer.cancel()
+        rc = p.wait()
+    return finish(flag, err, rc, final, u, rawpath)
+
+
+def kimi_usage(sid):
+    u = {"in": 0, "cache": 0, "out": 0}
+    if not sid:
+        return u
+    for w in glob.glob(os.path.join(KIMI_SESSIONS, "*", sid, "agents", "main", "wire.jsonl")):
+        with open(w, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "usage.record" and isinstance(ev.get("usage"), dict):
+                    g = ev["usage"]
+                    u["in"] += int(g.get("inputOther") or 0) + int(g.get("inputCacheCreation") or 0)
+                    u["cache"] += int(g.get("inputCacheRead") or 0)
+                    u["out"] += int(g.get("output") or 0)
+    return u
+
+
+def run_kimi(model, cfg, cwd, text, rawpath, timeout, prof):
+    cmd = [KIMI, "-p", text, "-m", MODELS[model]["alias"],
+           "--agent-file", os.path.join(BASE, prof["agent"]), "--output-format", "stream-json"]
+    out = prof.get("out")
+    if out:                                   # 能写文件的工人：写入由系统沙箱限定在结果文件夹
+        cmd = [SANDBOX, "-p", sandbox_profile(out)] + cmd
+    final, sid, err, flag = None, None, None, {}
+    with open(rawpath, "w", encoding="utf-8") as raw, open(rawpath + ".err", "w") as errf:
+        p = _spawn(cmd, cwd, dict(os.environ, **WORKER_ENV), errf, subprocess.DEVNULL)
+        kill = _killer(p, flag)
+        timer = threading.Timer(timeout, kill, ["超时"])
+        timer.start()
+        try:
+            for line in p.stdout:
+                raw.write(line)
+                raw.flush()
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                _alarm(ev, prof["tools"], kill, flag, cwd, out)
+                if ev.get("role") == "assistant":
+                    c = ev.get("content")
+                    if isinstance(c, list):
+                        c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    if isinstance(c, str) and c.strip():
+                        final = c
+                elif ev.get("role") == "meta" and ev.get("type") == "session.resume_hint":
+                    sid = ev.get("session_id")
+        except Exception as e:
+            err = _read_failed(kill, err, e)
+        except BaseException:                 # 被打断（如 Ctrl-C）：不要结果，但不能留下工人
+            kill("中断")
+            p.wait()
+            raise
+        finally:
+            timer.cancel()
+        rc = p.wait()
+    return finish(flag, err, rc, final, kimi_usage(sid), rawpath)
+
+
+WEB_TOOLS = {"WebSearch": "query", "FetchURL": "url"}
+
+
+def web_audit(rawpath):
+    """从 kimi 原始日志里抽出本次全部搜索词和 URL；过长的标红，供总工过目。"""
+    out = []
+    try:
+        f = open(rawpath, encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    with f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            # 形状不对的一律跳过或原样列出，不许出错：这里一出错，结果文件就写不出来
+            tcs = ev.get("tool_calls") if isinstance(ev, dict) else None
+            for tc in tcs if isinstance(tcs, list) else []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                name = fn.get("name") if isinstance(fn, dict) else None
+                key = WEB_TOOLS.get(name) if isinstance(name, str) else None
+                if not key:
+                    continue
+                raw = fn.get("arguments") or "{}"
+                args = raw
+                if isinstance(raw, str):
+                    try:
+                        args = json.loads(raw)
+                    except ValueError:
+                        args = None
+                val = str(args.get(key, "")) if isinstance(args, dict) else str(raw)
+                qs = val.split("?", 1)[1] if key == "url" and "?" in val else ""
+                bad = len(val) > 100 if key == "query" else len(qs) > 100
+                out.append(("‼ " if bad else "  ") + "%s: %s" % (name, val))
+    return out
+
+
+# ---------- 越界审计：工人跑完以后翻原始记录，不碰读输出的循环 ----------
+
+def _where(path, cwd, cfg):
+    """路径落在哪：None 工作目录内；「普通」目录外但在派工范围内；「严重」禁区内或派工范围以外。"""
+    if "\x00" in path:
+        raise ValueError("路径里有空字符")
+    full = os.path.expanduser(path)
+    if not os.path.isabs(full):
+        full = os.path.join(cwd, full)
+    k = _key(os.path.realpath(full))
+    if _inside(k, _key(cwd)):
+        return None
+    if any(_inside(k, _key(_real(d))) for d in cfg["deny_roots"]):
+        return "严重"
+    if not any(_inside(k, _key(_real(r))) for r in cfg["allow_roots"]):
+        return "严重"
+    return "普通"
+
+
+def _glob_dir(pattern):
+    """通配符写法里能确定的目录那一段（"" 表示就在起点目录）；判不了返回 None。"""
+    if pattern.startswith(("{", "[")):
+        return None
+    m = re.search(r"[*?\[{]", pattern)
+    if not m:
+        return pattern
+    head, rest = pattern[:m.start()], pattern[m.start():]
+    if ".." in rest.split("/"):
+        return None
+    return head.rsplit("/", 1)[0] + "/" if "/" in head else ""
+
+
+def _targets(name, args):
+    """这次调用碰了哪些路径；判不出来返回 None。"""
+    if not isinstance(args, dict):
+        return None
+    base = None
+    for k in ("file_path", "path"):
+        if k in args:
+            if not isinstance(args[k], str) or not args[k].strip():
+                return None
+            base = args[k]
+    if name in ("Glob", "glob"):
+        pat = args.get("pattern")
+        d = _glob_dir(pat) if isinstance(pat, str) else None
+        if d is None:
+            return None
+        if base is None or os.path.isabs(os.path.expanduser(d)):
+            return [d or "."]
+        return [os.path.join(base, d)]
+    if base is None:
+        return ["."] if name in ("Grep", "grep") else None
+    return [base]
+
+
+def _short(args):
+    try:
+        s = json.dumps(args, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = repr(args)
+    return s if len(s) <= 160 else s[:160] + "…"
+
+
+def written_files(rawpath, cwd, out):
+    """能写文件的工人往结果文件夹里写了哪些文件（按调用顺序去重）。"""
+    res = []
+    with open(rawpath, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            for name, args in _calls(ev):
+                if name in WRITE_TOOLS and _write_ok(name, args, cwd, out):
+                    for p in _targets(name, args):
+                        full = os.path.expanduser(p)
+                        full = full if os.path.isabs(full) else os.path.join(cwd, full)
+                        if full not in res:
+                            res.append(full)
+    return res
+
+
+def read_audit(rawpath, cwd, cfg, allowed, out=None):
+    """工人读过哪些工作目录以外的地方、用过哪些名单以外的工具、往结果文件夹以外写过什么。
+    返回（给人看的行，有没有严重的）。"""
+    lines, seen, serious = [], set(), False
+
+    def add(mark, kind, name, what):
+        line = "%s %s %s: %s" % (mark, kind, name, what)
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+
+    with open(rawpath, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            for name, args in _calls(ev):
+                if name not in allowed:
+                    serious = True
+                    add("‼", "不该有的工具", name, _short(args))
+                    continue
+                if name in WEB_TOOLS:                        # 联网的由 web_audit 列
+                    continue
+                if name in WRITE_TOOLS:
+                    if not _write_ok(name, args, cwd, out):
+                        serious = True
+                        add("‼", "写到结果文件夹以外", name, _short(args))
+                    continue
+                paths = _targets(name, args)
+                for p in paths or []:
+                    try:
+                        w = _where(p, cwd, cfg)
+                    except (ValueError, OSError):
+                        paths = None
+                        break
+                    if w == "严重":
+                        serious = True
+                        add("‼", "严重越界", name, p)
+                    elif w:
+                        add(" ", "普通越界", name, p)
+                if paths is None:
+                    add("？", "没判出来", name, _short(args))
+    return lines, serious
+
+
+def finish(flag, err, rc, final, u, rawpath):
+    if flag.get("why"):
+        status = flag["why"]
+    elif err or rc != 0 or not final:
+        status = "失败"
+    else:
+        status = "完成"
+    if status == "失败" and not err:
+        try:
+            with open(rawpath + ".err", encoding="utf-8", errors="replace") as f:
+                err = f.read().strip()[-600:] or None
+        except OSError:
+            pass
+    return {"status": status, "err": err, "final": final or "", "u": u,
+            "killed": flag.get("why"), "notes": flag.get("notes", [])}
+
+
+# ---------- 操作清单：apply / undo ----------
+# 工人只交清单，总工审过后由这里执行。只支持 mkdir / move / rename：不删除、不覆盖。
+# 任何一条校验不过，整份拒绝，一条都不执行。
+
+UNDO_DIR = os.path.join(OUT, "撤销")
+
+
+def _key(p):
+    """APFS 默认不区分大小写、会做 Unicode 归一化：比较用 NFC + 小写。"""
+    return unicodedata.normalize("NFC", p).lower()
+
+
+def _protected():
+    """保护清单里的路径（展开通配）。"""
+    lst = os.path.join(os.path.dirname(BASE), "bin", "保护清单.txt")
+    res = set()
+    try:
+        with open(lst, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    for g in glob.glob(_p(line)) or [_p(line)]:
+                        a = os.path.abspath(g)
+                        res.add(_key(a))
+                        # 清单里的路径可能经过软链接（如 /tmp → /private/tmp），apply / undo 比的是解析过的真实路径：
+                        # 上级目录解析后的写法也算（最后一级不跟进去，锁的是链接本身）
+                        res.add(_key(os.path.join(os.path.realpath(os.path.dirname(a)), os.path.basename(a))))
+    except OSError:
+        pass
+    return res
+
+
+def _locked(path):
+    try:
+        return bool(os.lstat(path).st_flags & (stat.UF_IMMUTABLE | stat.SF_IMMUTABLE))
+    except (OSError, AttributeError):
+        return False
+
+
+class Plan(object):
+    """按顺序模拟清单执行后的目录状态，用来查同名、父目录是否存在。"""
+
+    def __init__(self, root, cfg):
+        self.root, self.cfg = root, cfg
+        self.added, self.gone = {}, set()   # key -> 是否目录；已移走的 key
+        self.protected = _protected()
+
+    def path(self, rel, i, what):
+        if not isinstance(rel, str) or not rel.strip():
+            raise Refused("第 %d 条：%s 为空。" % (i, what))
+        if os.path.isabs(rel) or rel.startswith("~"):
+            raise Refused("第 %d 条：%s 必须是相对根目录的路径：%s" % (i, what, rel))
+        parts = rel.replace("\\", "/").split("/")
+        if any(x in ("", ".", "..") for x in parts):
+            raise Refused("第 %d 条：%s 不许含 . / .. / 空段：%s" % (i, what, rel))
+        full = os.path.join(self.root, *parts)
+        # 逐级检查：已存在的每一级都不能是软链接、不能是加锁条目
+        cur = self.root
+        for x in parts:
+            cur = os.path.join(cur, x)
+            if os.path.islink(cur):
+                raise Refused("第 %d 条：%s 路径经过软链接：%s" % (i, what, cur))
+            if _key(cur) in self.protected or _locked(cur):
+                raise Refused("第 %d 条：%s 碰到受保护/加锁路径：%s" % (i, what, cur))
+        for d in self.cfg["deny_roots"]:
+            if _inside(_key(full), _key(_real(d))):
+                raise Refused("第 %d 条：%s 在禁区内：%s" % (i, what, full))
+        return full
+
+    def exists(self, full):
+        k = _key(full)
+        if k in self.added:
+            return True
+        if k in self.gone:
+            return False
+        par, name = os.path.split(full)
+        try:
+            return any(_key(n) == _key(name) for n in os.listdir(par))
+        except OSError:
+            return False
+
+    def isdir(self, full):
+        k = _key(full)
+        if k in self.added:
+            return self.added[k]
+        return k not in self.gone and os.path.isdir(full)
+
+    def check(self, i, op):
+        kind = op.get("op") if isinstance(op, dict) else None
+        if kind not in ("mkdir", "move", "rename"):
+            raise Refused("第 %d 条：不支持的操作 %r（只允许 mkdir / move / rename）。" % (i, kind))
+        to = self.path(op.get("to"), i, "to")
+        if not self.isdir(os.path.dirname(to)):
+            raise Refused("第 %d 条：目标的上级目录不存在：%s" % (i, os.path.dirname(to)))
+        if _locked(os.path.dirname(to)):
+            raise Refused("第 %d 条：目标的上级目录已加锁：%s" % (i, os.path.dirname(to)))
+        if self.exists(to):
+            raise Refused("第 %d 条：目标已存在（不区分大小写）：%s" % (i, to))
+        if kind == "mkdir":
+            self.added[_key(to)] = True
+            return {"op": "mkdir", "to": to}
+        frm = self.path(op.get("from"), i, "from")
+        if not self.exists(frm) or _key(frm) in self.added:
+            raise Refused("第 %d 条：源不存在，或是本清单前面才建/移来的：%s" % (i, frm))
+        if _inside(_key(to), _key(frm)):
+            raise Refused("第 %d 条：不能把目录移进它自己里面：%s" % (i, frm))
+        if _locked(os.path.dirname(frm)):
+            raise Refused("第 %d 条：源所在目录已加锁：%s" % (i, os.path.dirname(frm)))
+        if kind == "rename" and _key(os.path.dirname(frm)) != _key(os.path.dirname(to)):
+            raise Refused("第 %d 条：rename 只能在同一目录内改名，跨目录请用 move。" % i)
+        self.gone.add(_key(frm))
+        self.added[_key(to)] = os.path.isdir(frm)
+        return {"op": kind, "from": frm, "to": to}
+
+
+def _claim(paths_of):
+    """独占创建一组文件（不覆盖已有文件），返回这组路径。paths_of(六位随机十六进制) 给出这组路径；
+    其中哪个已经存在，就删掉这一轮自己刚建的空文件，换个随机串重来。"""
+    for _ in range(20):
+        paths, made = paths_of(uuid.uuid4().hex[:6]), []
+        try:
+            for p in paths:
+                os.close(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+                made.append(p)
+            return paths
+        except FileExistsError:
+            for p in made:
+                os.remove(p)
+    raise OSError("连续 20 次撞上已有的文件名，没建成：%s" % paths[0])
+
+
+def _load_ops(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    ops = data.get("ops") if isinstance(data, dict) else data
+    if not isinstance(ops, list) or not ops:
+        raise Refused("清单里没有 ops。")
+    return ops
+
+
+def _save_undo(ts, root, done):
+    os.makedirs(UNDO_DIR, exist_ok=True)
+    path, = _claim(lambda h: (os.path.join(UNDO_DIR, "%s-%s-apply.json" % (ts, h)),))
+    with open(path, "w", encoding="utf-8") as f:            # 上一行已独占建好，这里写的是自己的文件
+        json.dump({"root": root, "done": done}, f, ensure_ascii=False, indent=1)
+    return path
+
+
+def cmd_apply(argv):
+    ap = argparse.ArgumentParser(prog="waibao apply", description="照操作清单执行 mkdir / move / rename，不删除、不覆盖")
+    ap.add_argument("--dir", required=True, help="根目录；清单里的路径都相对它，必须在 allow_roots 内")
+    ap.add_argument("--list", required=True, help="操作清单 JSON：{\"ops\":[...]}")
+    ap.add_argument("--dry-run", action="store_true", help="只校验，不执行")
+    a = ap.parse_args(argv)
+    cfg = load_cfg()
+    root = check_dir(a.dir, cfg)
+    if _key(root) == _key(HOME) or _locked(root):
+        raise Refused("根目录不能是家目录或加锁目录：%s" % root)
+    ops = _load_ops(a.list)
+    cap = int(cfg.get("apply_max_ops", 200))
+    if len(ops) > cap:
+        raise Refused("清单 %d 条，超过上限 %d 条。" % (len(ops), cap))
+    plan = Plan(root, cfg)
+    todo = [plan.check(i, op) for i, op in enumerate(ops, 1)]
+    print("[waibao] 清单校验通过：%d 条（%s）" % (len(todo), root))
+    for t in todo:
+        print("  %-6s %s%s" % (t["op"], (t["from"] + " → ") if "from" in t else "", t["to"]))
+    if a.dry_run:
+        print("[waibao] dry-run：未执行")
+        return 0
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    done, err = [], None
+    for t in todo:
+        try:
+            if t["op"] == "mkdir":
+                os.mkdir(t["to"])
+            else:
+                if os.path.lexists(t["to"]):           # 执行瞬间再查一次，防并发
+                    raise OSError("目标已存在：%s" % t["to"])
+                os.rename(t["from"], t["to"])
+            done.append(t)
+        except OSError as e:
+            err = "%s %s 失败：%s" % (t["op"], t["to"], e)
+            break
+    undo = _save_undo(ts, root, done)
+    print("[waibao] 已执行 %d / %d 条；撤销：%s undo %s" % (len(done), len(todo), os.path.realpath(__file__), undo))
+    if err:
+        print("[waibao] 停在这里：%s（后面的没执行）" % err, file=sys.stderr)
+        return 3
+    return 0
+
+
+# 撤销记录里每种操作该有的字段：只认 apply 写得出来的这几种。
+UNDO_FIELDS = {"mkdir": {"op", "to"}, "move": {"op", "from", "to"}, "rename": {"op", "from", "to"}}
+
+
+def _undo_path(plan, root, p, i, what):
+    """撤销记录里的一条绝对路径：必须逐字以「根目录/」开头，剩下的部分按 apply 的规矩逐级查
+    （不许 . / .. / 空段、不经软链接、不碰保护清单和加锁条目、不进禁区），还得和规整写法一字不差。"""
+    if not isinstance(p, str) or "\x00" in p:
+        raise Refused("第 %d 条：%s 不是合法路径：%r" % (i, what, p))
+    if not p.startswith(root + os.sep):
+        raise Refused("第 %d 条：%s 不在记录的根目录 %s 里面：%s" % (i, what, root, p))
+    full = plan.path(p[len(root) + 1:], i, what)
+    if full != p:
+        raise Refused("第 %d 条：%s 写法不规整：%s" % (i, what, p))
+    return full
+
+
+def _review_undo(rec, cfg):
+    """执行前整份预审撤销记录，返回要撤销的条目（apply 的顺序）。任何一条不合格就整份拒绝，一条都不执行。
+    根目录按当前 预算.json 重查（allow_roots / deny_roots，不是家目录、没加锁、没经软链接），
+    每条的 from / to 都必须在这个根目录里，逐级检查复用 apply 的 Plan.path。"""
+    if not isinstance(rec, dict) or set(rec) != {"root", "done"}:
+        raise Refused("撤销记录的结构不对：应当只有 root 和 done 两项。")
+    root, done = rec["root"], rec["done"]
+    if not isinstance(root, str) or not os.path.isabs(root) or "\x00" in root or not isinstance(done, list):
+        raise Refused("撤销记录的结构不对：root 要是绝对路径，done 要是列表。")
+    real = check_dir(root, cfg)
+    if real != root:
+        raise Refused("记录的根目录经过软链接或写法不规整：%s（实际是 %s）" % (root, real))
+    if _key(real) == _key(HOME) or _locked(real):
+        raise Refused("根目录不能是家目录或加锁目录：%s" % real)
+    plan = Plan(real, cfg)
+    todo = []
+    for i, t in enumerate(done, 1):
+        kind = t.get("op") if isinstance(t, dict) else None
+        if kind not in UNDO_FIELDS or set(t) != UNDO_FIELDS[kind]:
+            raise Refused("第 %d 条：不是 apply 记下的操作（只认 mkdir / move / rename 和它们的字段）：%s"
+                          % (i, _short(t)))
+        step = {"op": kind, "to": _undo_path(plan, real, t["to"], i, "to")}
+        if kind != "mkdir":
+            frm = step["from"] = _undo_path(plan, real, t["from"], i, "from")
+            if _inside(_key(step["to"]), _key(frm)):
+                raise Refused("第 %d 条：to 在 from 里面：%s" % (i, frm))
+            if kind == "rename" and _key(os.path.dirname(frm)) != _key(os.path.dirname(step["to"])):
+                raise Refused("第 %d 条：rename 的 from 和 to 不在同一目录。" % i)
+        todo.append(step)
+    return todo
+
+
+def _desc(t):
+    return "%s %s%s" % (t["op"], (t["from"] + " → ") if "from" in t else "", t["to"])
+
+
+def _note_undo(record, todo, n, why):
+    """撤销停在半路：在撤销记录旁边追加写明撤到了哪一步（追加，不盖掉之前几次的）。返回进度文件路径，写不成返回 None。"""
+    path = record + ".撤销进度.txt"
+    total, stop = len(todo), len(todo) - n          # 条目按 apply 的顺序编号，撤销从最后一条倒着来
+    lines = ["== %s ==" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             "撤销记录：%s（共 %d 条，从第 %d 条倒着撤）" % (os.path.abspath(record), total, total)]
+    lines += ["已撤销：第 %d 条 %s" % (k, _desc(todo[k - 1])) for k in range(total, stop, -1)]
+    lines.append("停在：第 %d 条 %s；原因：%s" % (stop, _desc(todo[stop - 1]), why))
+    if stop > 1:
+        lines.append("没执行：第 %d 条到第 1 条" % (stop - 1))
+    lines.append("注意：重跑 undo 会从第 %d 条重新开始，不会跳过以前撤销过的条目（撞上就停）；剩下的可以对照上面手工处理。"
+                 % total)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n\n")
+        return path
+    except OSError:
+        return None
+
+
+def cmd_undo(argv):
+    ap = argparse.ArgumentParser(prog="waibao undo", description="按撤销记录反向恢复 apply 的操作（先整份预审）")
+    ap.add_argument("record")
+    a = ap.parse_args(argv)
+    if not os.path.isfile(a.record):
+        raise Refused("撤销记录不存在：%s" % a.record)
+    try:
+        with open(a.record, encoding="utf-8") as f:
+            rec = json.load(f)
+    except ValueError as e:
+        raise Refused("撤销记录读不出来，不是 apply 写的 JSON：%s" % e)
+    todo = _review_undo(rec, load_cfg())
+    print("[waibao] 撤销记录预审通过：%d 条（%s）" % (len(todo), rec["root"]))
+    n = 0
+    for t in reversed(todo):
+        why = None
+        if t["op"] == "mkdir":
+            try:
+                os.rmdir(t["to"])                       # 只删空目录：里面有东西就停
+            except OSError as e:
+                why = "撤销 mkdir %s 失败（%s）" % (t["to"], e)
+        else:
+            par, name = os.path.split(t["from"])
+            clash = os.path.isdir(par) and any(_key(x) == _key(name) for x in os.listdir(par))
+            if clash or not os.path.isdir(par) or not os.path.lexists(t["to"]):
+                why = "%s 无法移回 %s（原位已有同名、原目录不在或文件已不在）" % (t["to"], t["from"])
+            else:
+                try:
+                    os.rename(t["to"], t["from"])
+                except OSError as e:
+                    why = "%s 移回 %s 失败（%s）" % (t["to"], t["from"], e)
+        if why:
+            note = _note_undo(a.record, todo, n, why)
+            print("[waibao] 停：%s；已撤销 %d 条（后面的没执行）；%s"
+                  % (why, n, "撤到哪一步写在 %s" % note if note else "撤销进度没写成"), file=sys.stderr)
+            return 3
+        n += 1
+    os.rename(a.record, a.record + ".已撤销")
+    print("[waibao] 已撤销 %d 条" % n)
+    return 0
+
+
+# ---------- 入口 ----------
+
+def show_status(cfg):
+    today = datetime.date.today().isoformat()
+    with Locked():
+        rows = read_rows()
+        sweep(rows)
+        if rows:
+            write_rows(rows)
+    spent, calls = today_totals(rows, today)
+    print("[waibao] 今天 %s（日上限只提醒，不拦）：" % today)
+    for m in ["flash"] + sorted(cfg["kimi_daily_calls"]):
+        print("  " + today_line(m, cfg, spent, calls))
+    print("  超长上限：不给 --timeout 时 %d 秒收工；给了可以更长，回执提醒" % int(cfg["timeout_sec"]))
+    for r in rows[-8:]:
+        print("  %s %s %-5s %s %ss ¥%s  %s" % (r["日期"], r["开始时间"], r["模型"], r["状态"],
+                                               r["耗时秒"] or "-", r["估算花费元"] or "0", r["标签"]))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("apply", "undo"):
+        return (cmd_apply if sys.argv[1] == "apply" else cmd_undo)(sys.argv[2:])
+    ap = argparse.ArgumentParser(prog="waibao", description="把任务派给 dsh / kimi 的无头工人")
+    ap.add_argument("model", nargs="?", choices=sorted(MODELS), help="flash 走 dsh；k3 / k28 走 kimi")
+    ap.add_argument("--dir", help="工人的工作目录，只能在允许外发的范围内；加了 --web 可以不给")
+    ap.add_argument("--web", action="store_true",
+                    help="联网工人：只有搜索和读网页，读不了本地文件（只对 k3 / k28）；不加就是本地只读，没有联网工具")
+    ap.add_argument("--out", help="能写文件的工人（只对 k3 / k28）：只能往这个文件夹里写，它必须在 --dir 里面，没有会新建")
+    ap.add_argument("--tag", help="短标签，用在结果文件名和账本里")
+    ap.add_argument("--plan", help="一句话：预估操作、成本、规划（记入账本）；超上限的写明用户批准")
+    ap.add_argument("--task", help="任务文本；不给则读 --task-file 或标准输入")
+    ap.add_argument("--task-file")
+    ap.add_argument("--timeout", type=int,
+                    help="秒，到点收工；不给就按 预算.json 的 timeout_sec（超长上限），给得更长只提醒不拦")
+    ap.add_argument("--dry-run", action="store_true", help="只做检查并打印命令，不调用模型，不记账")
+    ap.add_argument("--status", action="store_true", help="看今天的用量")
+    a = ap.parse_args()
+    cfg = load_cfg()
+
+    if a.status:
+        show_status(cfg)
+        return 0
+    if not a.model:
+        raise Refused("缺少模型：flash / k3 / k28。")
+    shell = MODELS[a.model]["shell"]
+    if a.web and shell != "kimi":
+        raise Refused("%s 不接受 --web：联网查资料派 k28 或 k3。" % a.model)
+    if a.out and shell != "kimi":
+        raise Refused("%s 不接受 --out：要写文件派 k3 或 k28。" % a.model)
+    if a.out and a.web:
+        raise Refused("--out 和 --web 不能一起用：写文件的工人不联网。")
+    if a.timeout is not None and a.timeout <= 0:
+        raise Refused("--timeout 要大于 0。")
+    for name in ("dir", "tag", "plan"):
+        if not getattr(a, name) and not (name == "dir" and a.web):
+            raise Refused("缺少 --%s。" % name)
+    prof = dict(PROFILES["kimi-web" if a.web else "kimi-write" if a.out else shell])
+
+    if a.web and not a.dir and not os.path.isdir(WEB_DIR):
+        raise Refused("联网工作目录不存在：%s" % WEB_DIR)
+    cwd = check_dir(a.dir or WEB_DIR, cfg)
+    if a.out:
+        out = _real(a.out)
+        if not _inside(_key(out), _key(cwd)):
+            raise Refused("--out 必须在 --dir 里面：%s" % a.out)
+        if os.path.exists(out) and not os.path.isdir(out):
+            raise Refused("--out 已经是个文件，不是文件夹：%s" % a.out)
+        if not os.path.exists(SANDBOX):
+            raise Refused("找不到系统沙箱 %s，不能派能写文件的工人。" % SANDBOX)
+        if not a.dry_run:
+            os.makedirs(out, exist_ok=True)
+        prof["out"] = out
+    if a.task:
+        task = a.task
+    elif a.task_file:
+        with open(a.task_file, encoding="utf-8") as f:
+            task = f.read()
+    elif not sys.stdin.isatty():
+        task = sys.stdin.read()
+    else:
+        task = ""
+    if not task.strip():
+        raise Refused("任务为空。")
+    with open(os.path.join(BASE, prof["rules"]), encoding="utf-8") as f:
+        rules = f.read().rstrip()
+    if prof.get("out"):
+        rules = rules.replace("{结果文件夹}", prof["out"])
+    text = rules + "\n" + task.strip() + "\n"
+    hint = ""
+    if not a.web and WEB_HINT.search(task):
+        hint = "提醒：任务书里像是要联网，但这次派的是本地工人，没有联网工具；要联网请派 k28 / k3 并加 --web。"
+
+    limit = int(cfg["timeout_sec"])
+    timeout = a.timeout or limit
+    long_note = ""
+    if timeout > limit:
+        long_note = "⚠ 这次时限 %d 秒，超过超长上限 %d 秒（只提醒，没拦）" % (timeout, limit)
+    tag = re.sub(r"[^\w一-鿿-]+", "-", a.tag).strip("-")[:30] or "任务"
+    now = datetime.datetime.now()
+    binary = DSH if shell == "dsh" else KIMI
+    if not os.path.exists(binary):
+        raise Refused("找不到 %s 的命令行：%s" % (shell, binary))
+
+    if a.dry_run:
+        with Locked():
+            rows = read_rows()
+            sweep(rows)
+        warn = check_budget(a.model, cfg, rows, now.date().isoformat())
+        print("[waibao] 检查通过（未调用模型，未记账）")
+        print("  壳/模型：%s / %s   目录：%s" % (shell, a.model, cwd))
+        print("  档案：%s（工具只有 %s）" % (prof["name"], "、".join(prof["tools"])))
+        if prof.get("out"):
+            print("  结果文件夹：%s（系统沙箱只放行这里的写入）" % prof["out"])
+        print("  时限：%ds   任务长度：%d 字符" % (timeout, len(text)))
+        for x in (hint, warn, long_note):
+            if x:
+                print("[waibao] " + x)
+        return 0
+
+    if hint:
+        print("[waibao] " + hint, flush=True)
+    os.makedirs(os.path.join(OUT, "原始"), exist_ok=True)
+    # 文件名：时间戳 + 六位随机串 + 模型 + 标签。原始记录和结果文件先独占建好（同名就换随机串），
+    # 同一秒、同模型、同标签的两次派工也不会互相覆盖；后面往里写的都是自己建的文件。
+    ts = now.strftime("%Y%m%d-%H%M%S")
+    rawpath, outpath = _claim(lambda h: (os.path.join(OUT, "原始", "%s-%s-%s-%s.jsonl" % (ts, h, a.model, tag)),
+                                         os.path.join(OUT, "%s-%s-%s-%s.md" % (ts, h, a.model, tag))))
+    rid = uuid.uuid4().hex[:12]
+    plan = a.plan + ("（结果文件夹：%s）" % prof["out"] if prof.get("out") else "")
+    warn = reserve(a.model, cfg, {"id": rid, "日期": now.date().isoformat(), "开始时间": now.strftime("%H:%M:%S"),
+                                  "模型": a.model, "壳": shell, "标签": tag, "目录": cwd, "说明": plan})
+    for x in (warn, long_note):
+        if x:
+            print("[waibao] " + x, flush=True)
+    t0 = time.time()
+    res = {"status": "中断", "err": "调度脚本异常退出", "final": "", "u": {"in": 0, "cache": 0, "out": 0}}
+    audit, serious, audit_failed = [], False, False
+    try:
+        runner = run_dsh if shell == "dsh" else run_kimi
+        res = runner(a.model, cfg, cwd, text, rawpath, timeout, prof)
+    finally:
+        secs = int(round(time.time() - t0))
+        try:
+            audit, serious = read_audit(rawpath, cwd, cfg, prof["tools"], prof.get("out"))
+        except Exception as e:
+            audit, audit_failed = ["‼ 越界审计没跑成：%r" % (e,)], True
+        audit += ["？ " + n for n in res.get("notes", [])]
+        if serious and res["status"] in ("完成", "失败"):
+            res["status"] = "越界"
+        u = res["u"]
+        money = cost_of(a.model, cfg, u)
+        spent, calls = settle(rid, {"状态": res["status"], "耗时秒": str(secs), "输入未缓存": str(u["in"]),
+                                    "输入缓存": str(u["cache"]), "输出": str(u["out"]),
+                                    "估算花费元": "%.4f" % money, "结果文件": outpath})
+
+    body = res["final"].strip()
+    web, wrote = [], []
+    if shell == "kimi":
+        try:
+            web = web_audit(rawpath)
+        except Exception as e:
+            web, audit_failed = ["‼ 联网审计没跑成：%r" % (e,)], True
+    if prof.get("out"):
+        try:
+            wrote = written_files(rawpath, cwd, prof["out"])
+        except Exception as e:
+            wrote, audit_failed = ["‼ 写入清单没列成：%r" % (e,)], True
+    with open(outpath, "w", encoding="utf-8") as f:                 # 派工前已独占建好，是自己的文件
+        f.write("<!-- waibao %s | %s | %s | %ss | 入 %d / 缓存 %d / 出 %d | 估 ¥%.4f | 目录 %s%s -->\n\n"
+                % (a.model, res["status"], now.strftime("%Y-%m-%d %H:%M:%S"), secs,
+                   u["in"], u["cache"], u["out"], money, cwd,
+                   " | 结果文件夹 %s" % prof["out"] if prof.get("out") else ""))
+        f.write(body + "\n" if body else "（没有拿到最终回答）\n")
+        if audit:
+            f.write("\n## 调度器记录的越界（‼ = 禁区、派工范围以外、不该有的工具或写到结果文件夹以外；？ = 没判出来）\n\n"
+                    + "\n".join(audit) + "\n")
+        if web:
+            f.write("\n## 调度器记录的联网（‼ = 过长，需总工核查是否外泄）\n\n" + "\n".join(web) + "\n")
+        if wrote:
+            f.write("\n## 调度器记录的写入（结果文件夹里）\n\n" + "\n".join(wrote) + "\n")
+        if res["err"]:
+            f.write("\n## 调度器记录的错误\n\n%s\n" % res["err"])
+
+    today = today_line(a.model, cfg, spent, calls)
+    paid = "估 ¥%.4f（按高峰价）" % money if shell == "dsh" else "会员额度"
+    print("[waibao] %s · %s · %ds · 入 %d / 缓存 %d / 出 %d · %s · %s"
+          % (a.model, res["status"], secs, u["in"], u["cache"], u["out"], paid, today))
+    print("[waibao] 全文：%s" % outpath)
+    if long_note:
+        print("[waibao] " + long_note)
+    if a.web:
+        print("[waibao] 档案：联网（只有搜索和读网页，读不了本地文件）")
+    if prof.get("out"):
+        print("[waibao] 档案：本地读写（只能写 %s）；写了 %d 个文件%s"
+              % (prof["out"], len(wrote), "：" if wrote else ""))
+        for w in wrote[:20]:
+            print("  " + w)
+        if len(wrote) > 20:
+            print("  […还有 %d 个，见全文]" % (len(wrote) - 20))
+    if res["err"]:
+        print("[waibao] 错误：%s" % res["err"])
+    if audit:
+        print("[waibao] 越界记录 %d 条（‼ = 禁区、派工范围以外、不该有的工具或写到结果文件夹以外；？ = 没判出来）：" % len(audit))
+        print("\n".join(audit))
+    if web:
+        print("[waibao] 本次联网 %d 次（‼ = 过长，需核查）：" % len(web))
+        print("\n".join(web))
+    lines = body.splitlines()
+    if serious:
+        print("[waibao] ‼ 有严重越界：这次的回答当成不可信，这里不打印；要看自己打开全文。")
+    elif lines:
+        print("---")
+        print("\n".join(lines[:RECEIPT_LINES]))
+        if len(lines) > RECEIPT_LINES:
+            print("[…后面还有 %d 行，见全文]" % (len(lines) - RECEIPT_LINES))
+    return 0 if res["status"] == "完成" and not audit_failed else 3
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Refused as e:
+        print("[waibao] 拒绝：%s" % e, file=sys.stderr)
+        sys.exit(2)

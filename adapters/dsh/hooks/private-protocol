@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""SessionStart 钩子：把 DSH 私有协议按 JSON additionalContext 送进上下文。
+2026-10-08 换掉原来的 /bin/cat：DSH 桥接只认 JSON additionalContext，纯 stdout 会被丢弃
+（依据：dsh-hook-protocol 的 parseHookOutput() 只在 stdout 以 { 开头时读结构化字段；
+dsh-hooks-claude-code 的 contextFrom() 只吃 hookSpecificOutput.additionalContext）。
+出任何异常都静默放行（退出码 0、无输出）；文件不存在时也不报错。
+"""
+import json
+import os
+import sys
+
+PATH = os.path.expanduser("~/.dsh/private-protocol.md")
+
+
+def main():
+    with open(PATH, encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        return
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": text}}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

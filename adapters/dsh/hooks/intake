@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""UserPromptSubmit 钩子：用户每次提需求时，给本轮附一段 Qlimen 流程提示（additionalContext）。
+2026-10-06 瘦身后只挂在 DSH（那边协议会被压缩压掉，这是唯一的每轮提醒）；Claude 侧已停用。
+
+只附加上下文，永不阻塞。短消息、纯回复（批准/好/继续）不附加，避免噪音。
+出任何异常都静默放行（退出码 0、无输出）。
+"""
+import json
+import re
+import sys
+
+HINT = (
+    "【Qlimen】先判断这条消息是什么：\n"
+    "A. 只是让你评价/解释/回答/说观后感 → 只回答，不执行任何操作，不开新任务，不追问「要不要继续做」。\n"
+    "B. 是一个新需求或对已批方案的批准 → 新需求按 AGENTS 第 2 节：不是一步能完成的，先调研、写方案和清单、等批准；"
+    "对已批方案的明确批准 → 按方案连续执行。\n"
+    "拿不准属于 A 还是 B，按 A 处理并问一句。工人只经 waibao 派出（默认只读）；写入被拒先分清是加锁还是沙箱，是加锁就出 diff 请用户解锁。"
+)
+SHORT = re.compile(r"^\s*(好|好的|嗯|行|可以|收到|ok|OK|批准|同意|继续|是|对|没问题|开始)[\s。.!！]*$")
+
+
+def main():
+    data = json.load(sys.stdin)
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt or SHORT.match(prompt):
+        return
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": HINT}}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

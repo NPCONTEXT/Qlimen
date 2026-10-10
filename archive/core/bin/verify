@@ -1,0 +1,354 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""verify：按方案.md 第 5 节「验收清单」逐条机器检查（Qlimen 核心）。
+
+  verify 任务目录/方案.md          检查产出物，全部通过退出码 0，有失败 1
+  verify --plan 任务目录/方案.md   检查方案本身能否锁定（调研、验收清单是否写全）
+  verify --json ...                机器可读输出（给钩子用）
+  verify --skip-cmd ...            cmd: 条目不运行，记为「跳过」（钩子用：钩子进程权限比会话小、有时间限制，跑命令会误报）
+
+写法见 archive/core/flow/qlimen-flow/验收模板.md。只依赖系统自带 Python 3.9 标准库；
+xlsx 用 zipfile 解析，不需要 openpyxl。manual: 条目只列出、不判定。
+"""
+import argparse
+import csv
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.request
+import zipfile
+from xml.etree import ElementTree as ET
+
+KINDS = ("file", "dir", "xlsx", "xlsx-nonempty", "csv", "contains", "url", "urls-in", "cmd", "media", "manual")
+ITEM = re.compile(r"^\s*- \[[ xX]\]\s*(.*?)\s*$")
+NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+
+
+# ---------- 解析方案 ----------
+
+def sections(text):
+    """按 '## ' 二级标题切段，返回 {标题: 正文}。"""
+    out, cur = {}, None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            out[cur] = []
+        elif cur is not None:
+            out[cur].append(line)
+    return dict((k, "\n".join(v)) for k, v in out.items())
+
+
+def find_sec(secs, key):
+    for k, v in secs.items():
+        if key in k:
+            return v
+    return None
+
+
+def items(sec_text):
+    res = []
+    for line in (sec_text or "").splitlines():
+        if line.strip().startswith("<!--"):
+            continue
+        m = ITEM.match(line)
+        if m and m.group(1):
+            res.append(m.group(1))
+    return res
+
+
+def parse_item(s):
+    s = re.sub(r"\s+#.*$", "", s)           # 行尾注释
+    s = re.sub(r"[　]+（.*?）\s*$", "", s)   # 全角空格 + 括号说明
+    m = re.match(r"^([a-z\-]+):\s*(.*)$", s)
+    if not m or m.group(1) not in KINDS:
+        return None, s
+    return m.group(1), m.group(2).strip()
+
+
+# ---------- 工具 ----------
+
+def resolve(p, base):
+    p = os.path.expanduser(p.strip().strip('"'))
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
+
+
+def split_cmp(arg):
+    """'路径 rows >= 14' → (路径, 'rows', '>=', 14)"""
+    m = re.match(r"^(.*?)\s+(rows|duration)\s*(>=|<=|>|<|==|=)?\s*([\d.]+)(?:\s*-\s*([\d.]+))?\s*$", arg)
+    if not m:
+        return arg, None, None, None, None
+    return m.group(1), m.group(2), m.group(3) or ">=", float(m.group(4)), (float(m.group(5)) if m.group(5) else None)
+
+
+def cmp(v, op, n):
+    return {">=": v >= n, "<=": v <= n, ">": v > n, "<": v < n, "==": v == n, "=": v == n}[op]
+
+
+def xlsx_rows(path):
+    """读第一个工作表，返回二维字符串列表。"""
+    with zipfile.ZipFile(path) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", NS):
+                shared.append("".join(t.text or "" for t in si.iter("{%s}t" % NS["m"])))
+        sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        if not sheets:
+            return []
+        root = ET.fromstring(z.read(sheets[0]))
+        rows = []
+        for r in root.iter("{%s}row" % NS["m"]):
+            cells = {}
+            for c in r.findall("m:c", NS):
+                ref = c.get("r", "")
+                col = 0
+                for ch in re.match(r"[A-Z]*", ref).group(0):
+                    col = col * 26 + ord(ch) - 64
+                t = c.get("t")
+                v = c.find("m:v", NS)
+                if t == "s" and v is not None:
+                    val = shared[int(v.text)]
+                elif t == "inlineStr":
+                    val = "".join(x.text or "" for x in c.iter("{%s}t" % NS["m"]))
+                else:
+                    val = v.text if v is not None else ""
+                cells[col] = (val or "").strip()
+            if cells:
+                width = max(cells)
+                rows.append([cells.get(i, "") for i in range(1, width + 1)])
+        return [r for r in rows if any(r)]
+
+
+def file_text(path):
+    if path.lower().endswith(".xlsx"):
+        return "\n".join("\t".join(r) for r in xlsx_rows(path))
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def url_ok(u, timeout=15):
+    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 Qlimen-verify"})
+    for method in ("HEAD", "GET"):
+        req.method = method
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if 200 <= r.status < 400:
+                    return True, str(r.status)
+        except urllib.error.HTTPError as e:
+            if method == "GET":
+                return False, "HTTP %d" % e.code
+        except Exception as e:  # 网络错误
+            if method == "GET":
+                return False, type(e).__name__
+    return False, "?"
+
+
+# ---------- 各类检查 ----------
+
+def check(kind, arg, base):
+    """返回 (状态, 说明)；状态 ∈ 通过 / 失败 / 人工。"""
+    if kind == "manual":
+        return "人工", arg
+    if kind == "file":
+        p = resolve(arg, base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        return ("通过", "%d 字节" % os.path.getsize(p)) if os.path.getsize(p) > 0 else ("失败", "空文件")
+    if kind == "dir":
+        path, _, op, n, _ = split_cmp(arg.replace(">=", " rows >=").replace("rows rows", "rows"))
+        p = resolve(path, base)
+        if not os.path.isdir(p):
+            return "失败", "目录不存在：%s" % p
+        cnt = sum(len(fs) for _, _, fs in os.walk(p))
+        if n is not None and not cmp(cnt, op, n):
+            return "失败", "%d 个文件，要求 %s %g" % (cnt, op, n)
+        return "通过", "%d 个文件" % cnt
+    if kind in ("xlsx", "csv"):
+        path, _, op, n, _ = split_cmp(arg)
+        p = resolve(path, base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        if kind == "xlsx":
+            rows = xlsx_rows(p)
+        else:
+            with open(p, encoding="utf-8-sig", errors="replace", newline="") as f:
+                rows = [r for r in csv.reader(f) if any(c.strip() for c in r)]
+        data = max(len(rows) - 1, 0)
+        if n is not None and not cmp(data, op, n):
+            return "失败", "数据行 %d，要求 %s %g" % (data, op, n)
+        return "通过", "数据行 %d" % data
+    if kind == "xlsx-nonempty":
+        m = re.match(r"^(.*?)\s+列=(.+)$", arg)
+        if not m:
+            return "失败", "写法应为：xlsx-nonempty: 路径 列=A列名,B列名"
+        p = resolve(m.group(1), base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        rows = xlsx_rows(p)
+        if not rows:
+            return "失败", "表是空的"
+        head = rows[0]
+        bad = []
+        for col in [c.strip() for c in re.split(r"[,，]", m.group(2)) if c.strip()]:
+            if col not in head:
+                bad.append("缺列「%s」" % col)
+                continue
+            i = head.index(col)
+            empty = [str(k + 2) for k, r in enumerate(rows[1:]) if i >= len(r) or not r[i]]
+            if empty:
+                bad.append("「%s」第 %s 行为空" % (col, ",".join(empty[:10])))
+        return ("失败", "；".join(bad)) if bad else ("通过", "%d 行全部非空" % (len(rows) - 1))
+    if kind == "contains":
+        m = re.match(r'^(.*?)\s+"(.+)"$', arg)
+        if not m:
+            return "失败", '写法应为：contains: 路径 "文字"'
+        p = resolve(m.group(1), base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        return ("通过", "找到") if m.group(2) in file_text(p) else ("失败", "没找到「%s」" % m.group(2))
+    if kind == "url":
+        ok, why = url_ok(arg)
+        return ("通过" if ok else "失败"), why
+    if kind == "urls-in":
+        p = resolve(arg, base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        urls = sorted(set(URL_RE.findall(file_text(p))))
+        if not urls:
+            return "失败", "文件里没有链接"
+        bad = []
+        for u in urls:
+            ok, why = url_ok(u)
+            if not ok:
+                bad.append("%s（%s）" % (u, why))
+        if bad:
+            return "失败", "%d/%d 打不开：%s" % (len(bad), len(urls), "；".join(bad[:5]))
+        return "通过", "%d 条全部可打开" % len(urls)
+    if kind == "cmd":
+        try:
+            r = subprocess.run(arg, shell=True, cwd=base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return "失败", "超过 60 秒"
+        tail = (r.stdout or "").strip().splitlines()[-3:]
+        return ("通过" if r.returncode == 0 else "失败"), "退出码 %d %s" % (r.returncode, " / ".join(tail))[:300]
+    if kind == "media":
+        path, _, _, lo, hi = split_cmp(arg)
+        p = resolve(path, base)
+        if not os.path.isfile(p):
+            return "失败", "不存在：%s" % p
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "default=nw=1:nk=1", p], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+            d = float(r.stdout.strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return "失败", "ffprobe 读不出时长（没装 ffprobe？）"
+        if lo is not None and (d < lo or (hi is not None and d > hi)):
+            return "失败", "时长 %.2f 秒，要求 %g-%s" % (d, lo, hi if hi is not None else "∞")
+        return "通过", "时长 %.2f 秒" % d
+    return "失败", "未知类型"
+
+
+# ---------- 两种模式 ----------
+
+def verify_plan(text):
+    secs = sections(text)
+    probs = []
+    research = find_sec(secs, "调研")
+    if research is None:
+        probs.append("缺「1. 调研结果」一节")
+    else:
+        facts = [l for l in research.splitlines()
+                 if l.strip().startswith("- ") and "<" not in l and len(l.strip()) > 4]
+        if not facts:
+            probs.append("「调研结果」没有填写任何事实")
+    acc = find_sec(secs, "验收")
+    if acc is None:
+        probs.append("缺「5. 验收清单」一节")
+    else:
+        its = items(acc)
+        real = [i for i in its if "<" not in i]
+        if not real:
+            probs.append("验收清单为空或还是模板占位")
+        for i in real:
+            kind, _ = parse_item(i)
+            if kind is None:
+                probs.append("验收项不可检查（缺类型前缀）：%s" % i)
+        if real and all(parse_item(i)[0] == "manual" for i in real):
+            probs.append("验收项全是 manual，至少要有一条机器可查")
+    if find_sec(secs, "目标") is None:
+        probs.append("缺「2. 目标与范围」一节")
+    m = re.search(r"定级：\s*L(\d)", text)
+    if not m:
+        probs.append("头部没写定级（定级：L1/L2/L3）")
+    elif int(m.group(1)) >= 3:
+        rb = find_sec(secs, "回滚") or ""
+        if "回滚：" not in rb or re.search(r"回滚：\s*<", rb):
+            probs.append("L3 必须写回滚预案")
+    if m and int(m.group(1)) >= 2:
+        cons = find_sec(secs, "会诊") or ""
+        if not [l for l in cons.splitlines() if l.strip().startswith("- ") and "<" not in l]:
+            probs.append("L2/L3 必须有会诊记录")
+    return probs
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="verify", description="按方案的验收清单机器检查")
+    ap.add_argument("plan", help="方案.md 路径")
+    ap.add_argument("--plan", dest="plan_mode", action="store_true", help="只检查方案能否锁定")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--skip-cmd", action="store_true", help="cmd: 条目不运行，记为跳过")
+    a = ap.parse_args()
+    path = os.path.abspath(os.path.expanduser(a.plan))
+    if not os.path.isfile(path):
+        print("[verify] 找不到方案：%s" % path, file=sys.stderr)
+        return 2
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+
+    if a.plan_mode:
+        probs = verify_plan(text)
+        if a.json:
+            print(json.dumps({"ok": not probs, "problems": probs}, ensure_ascii=False))
+        else:
+            print("[verify] 方案%s：%s" % ("可以锁定" if not probs else "不能锁定", path))
+            for p in probs:
+                print("  ✗ %s" % p)
+        return 0 if not probs else 1
+
+    base = os.path.dirname(path)
+    res = []
+    for raw in items(find_sec(sections(text), "验收")):
+        kind, arg = parse_item(raw)
+        if kind is None:
+            res.append({"item": raw, "status": "失败", "note": "不可检查：缺类型前缀"})
+            continue
+        if kind == "cmd" and a.skip_cmd:
+            res.append({"item": raw, "status": "跳过", "note": "这里不运行命令；交付前在会话里跑 verify"})
+            continue
+        try:
+            st, note = check(kind, arg, base)
+        except Exception as e:  # 单条出错不影响其他条
+            st, note = "失败", "检查出错：%s" % e
+        res.append({"item": raw, "status": st, "note": note})
+    fail = [r for r in res if r["status"] == "失败"]
+    if a.json:
+        print(json.dumps({"ok": not fail and bool(res), "results": res}, ensure_ascii=False))
+    else:
+        mark = {"通过": "✓", "失败": "✗", "人工": "?", "跳过": "-"}
+        for r in res:
+            print("  %s %s —— %s" % (mark[r["status"]], r["item"], r["note"]))
+        n = dict((k, sum(1 for r in res if r["status"] == k)) for k in mark)
+        print("[verify] 通过 %d · 失败 %d · 待人工 %d%s" % (n["通过"], n["失败"], n["人工"], " · 跳过 %d" % n["跳过"] if n["跳过"] else ""))
+        if not res:
+            print("[verify] 验收清单为空")
+    return 0 if (res and not fail) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

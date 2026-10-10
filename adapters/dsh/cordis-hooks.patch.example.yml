@@ -1,0 +1,8 @@
+# Qlimen：挂载 Claude Code 钩子桥（挂了哪些钩子以 adapters/dsh/hooks.json 为准；本文件是模板，install.sh 生成 cordis-hooks.patch.yml）
+# 由 adapters/dsh/挂载说明.md 说明；要撤掉，删掉本段即可。
+- insert:
+    - id: qlimen-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: {{QLIMEN_HOME}}/adapters/dsh/hooks.json
+        defaultTimeoutMs: 30000

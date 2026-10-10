@@ -1,0 +1,40 @@
+# Qlimen 受保护路径（qlimen-lock / qlimen-unlock 读同目录的 保护清单.txt；install.sh 用本文件生成它）
+# 每行一个路径，支持 ~ 和 * 通配；# 开头为注释。
+# 目录加锁 = 不能在里面新建/删除/改名条目（不影响子目录内部）；文件加锁 = 不能改、删、改名。
+# 软链接锁的是链接本身（chflags -h）。不存在的路径会跳过，用不到的工具那几行留着也没关系。
+# 只锁核心协议、派工与安全件、钩子挂载、各工具入口、模型配置。
+# 不锁：Qlimen 顶层目录、各环境私有协议（要能当场写）、工人名册（waibao skill）、挂载说明、
+#       钩子脚本 intake、core/data/（账本和结果要一直写）、archive/。
+
+# 核心目录结构与核心协议
+{{QLIMEN_HOME}}/core
+{{QLIMEN_HOME}}/core/rules
+{{QLIMEN_HOME}}/core/rules/AGENTS.md
+
+# 工人：派工脚本、guard、守则、预算、工人档案
+{{QLIMEN_HOME}}/core/workers
+{{QLIMEN_HOME}}/core/workers/*
+
+# 加解锁脚本与本清单
+{{QLIMEN_HOME}}/core/bin
+{{QLIMEN_HOME}}/core/bin/*
+
+# flash 工人补丁（关掉命令行和联网，是工人的闸）
+{{QLIMEN_HOME}}/adapters/dsh/dsh-flash.patch.yml
+
+# 钩子挂载（guard 挂在这里）
+{{QLIMEN_HOME}}/adapters/dsh/hooks.json
+~/.claude/settings.json
+~/.codex/hooks.json
+
+# 各工具入口（指向核心协议的软链接）
+~/.dsh/AGENTS.md
+~/.kimi-code/AGENTS.md
+~/.claude/CLAUDE.md
+~/.claude/qlimen-AGENTS.md
+~/.codex/AGENTS.md
+
+# 模型配置（按你实际用的工具留）
+~/.dsh/profiles/desktop/cordis.patch.yml
+~/.dsh/profiles/headless/cordis.patch.yml
+~/.kimi-code/config.toml

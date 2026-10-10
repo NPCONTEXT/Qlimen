@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+tests/_沙盒-*/
+# install.sh 生成的本机配置
+core/workers/预算.json
+core/bin/保护清单.txt
+core/data/*
+!core/data/.gitkeep
+adapters/*/hooks.json
+adapters/dsh/cordis-hooks.patch.yml

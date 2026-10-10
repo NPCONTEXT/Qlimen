@@ -1,0 +1,292 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""PreToolUse 钩子（Claude Code hooks.json 方言，DSH 经 dsh-hooks-claude-code 桥接执行，Codex 同一方言）：
+不经 waibao、直接调用 dsh headless / kimi -p 的 shell 命令，弹框问用户（ask），不直接拦。
+
+这类调用不记账，也不套工人档案。2026-10-09 用户定：预算和调度只记录和提醒，用户批准高于预算控制。
+判断只看会执行的部分：一条简单命令里有壳名（kimi / dsh，按文件名认，全路径也算），它后面又有
+-p / --prompt（kimi）或 headless（dsh），就问。引号外带 --help、-h、--version 这类查帮助参数的放行。
+
+算文字、不查（写文档、写交接不会被问）：单引号里的；双引号里除命令替换以外的；结束符带引号的
+heredoc（<<'EOF'、<<"EOF"、<<\EOF）正文；被反斜杠转义的 \$( 和 \`；# 注释。
+会查（按同样规则递归，支持嵌套）：引号外的命令；$( ) 和反引号里的命令，不论在引号外、双引号里，
+还是在结束符没加引号的 heredoc（<<EOF）正文里，bash 都会真的执行；bash / sh / zsh -c 和 eval 的字符串。
+定位是防顺手，不防故意绕（壳名放进变量、在 python 里调用等不管）。
+引号、$( 或反引号没闭合时退回粗查：出现壳名就问（真 shell 里这条本来就跑不起来）。
+出任何其他异常都放行（退出码 0、无输出），不能因为钩子坏了让所有 Bash 命令跑不了。
+"""
+import json
+import os
+import re
+import sys
+
+WAIBAO = os.path.join(os.path.dirname(os.path.realpath(__file__)), "waibao")
+SHELL_TOOLS = ("Bash", "bash")
+REASON = ("这条命令像是不经 waibao 直接调用 dsh 无头模式 / kimi -p：不记账，也不套工人档案。"
+          "只是在写文字、或用户已经批准，就允许；否则改用 %s。" % WAIBAO)
+FREE = {"--help", "-h", "--version", "-V", "--dump-config", "--dump-default-config", "--dump-config-schema"}
+TRIGGER = {"kimi": lambda w: w in ("-p", "--prompt") or w.startswith("--prompt="),
+           "dsh": lambda w: w == "headless"}
+SUBSHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+# 运算符：长的在前。SEPS 是命令分隔（$( 的「(」、反引号也算，后面是一条新命令），其余是重定向。
+OPS = ("<<<", "<<-", "&&", "||", ";;", "|&", ">>", "<<", ">&", "<&", "&>", ">|",
+       ";", "|", "&", "(", ")", "<", ">", "`")
+SEPS = {";", ";;", "&&", "||", "|", "|&", "&", "\n", "(", ")", "`"}
+CRUDE = r"(?<![\w.-])(kimi|dsh)(?![\w-])"
+
+
+def _skip_heredoc(cmd, i, delim, strip_tabs):
+    """从第 i 个字符（正文第一行开头）往后找结束符那一行。返回 (正文结束位置, 结束符那一行之后的位置)。"""
+    while i < len(cmd):
+        j = cmd.find("\n", i)
+        line = (cmd[i:] if j < 0 else cmd[i:j]).rstrip("\r")
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            return i, (len(cmd) if j < 0 else j + 1)
+        if j < 0:
+            break
+        i = j + 1
+    return len(cmd), len(cmd)
+
+
+def _heredoc_word(cmd, i):
+    """读 << 后面的结束符。返回 (结束符, 带没带引号或反斜杠, 读完的位置)；读不出结束符返回 None。"""
+    word, quoted, n = [], False, len(cmd)
+    while i < n and cmd[i] not in " \t\r\n;|&<>()`":
+        c = cmd[i]
+        if c in "'\"":
+            j = cmd.find(c, i + 1)
+            if j < 0:
+                raise ValueError("引号没闭合")
+            word.append(cmd[i + 1:j])
+            quoted, i = True, j + 1
+        elif c == "\\" and i + 1 < n:
+            word.append(cmd[i + 1])
+            quoted, i = True, i + 2
+        else:
+            word.append(c)
+            i += 1
+    delim = "".join(word)
+    return (delim, quoted, i) if delim else None
+
+
+def _close_tick(s, i):
+    """s[i] 是开头反引号后的第一个字符；返回配对的结尾反引号的位置（跳过反斜杠转义的）。"""
+    while i < len(s):
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "`":
+            return i
+        i += 1
+    raise ValueError("反引号没闭合")
+
+
+def _untick(raw, in_dq):
+    """反引号里的原文 → 真正执行的命令：\\ \$ \` 去掉反斜杠，在双引号里的再加上 \"。"""
+    return re.sub(r'\\([\\$`"])' if in_dq else r"\\([\\$`])", r"\1", raw)
+
+
+def _close_paren(s, i):
+    """s[i] 是 $( 后的第一个字符；按命令语法往后走（跳过引号、反引号、注释，括号计数），
+    返回配对的「)」的位置。"""
+    depth, n = 1, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise ValueError("引号没闭合")
+            i = j + 1
+            continue
+        if c == '"':
+            i = _expand(s, i + 1, [], '"') + 1
+            continue
+        if c == "`":
+            i = _close_tick(s, i + 1) + 1
+            continue
+        if c == "#" and s[i - 1] in " \t\n;|&(":
+            j = s.find("\n", i)
+            if j < 0:
+                break
+            i = j
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError("$( 没闭合")
+
+
+def _expand(s, i, subs, stop):
+    """按双引号里（stop='"'）或不带引号的 heredoc 正文里（stop=None，走到 s 末尾）的规矩往后走：
+    其余都是文字，只有 $( ) 和反引号里的命令会执行，取出来放进 subs。
+    返回结尾双引号的位置；stop 为 None 时返回 len(s)。"""
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == stop:
+            return i
+        if c == "\\":
+            i += 2
+            continue
+        if s.startswith("$(", i):
+            j = _close_paren(s, i + 2)
+            subs.append(s[i + 2:j])
+            i = j + 1
+            continue
+        if c == "`":
+            j = _close_tick(s, i + 1)
+            subs.append(_untick(s[i + 1:j], stop is not None))
+            i = j + 1
+            continue
+        i += 1
+    if stop is None:
+        return n
+    raise ValueError("引号没闭合")
+
+
+def tokens(cmd):
+    """切词：返回 (词表, 要另查的命令)。词表是 [(文字, 带没带引号)]，运算符的第二项是 None；
+    要另查的命令是双引号里、不带引号的 heredoc 正文里 $( ) 和反引号中的命令原文。
+    引号外的「反斜杠 + 换行」是续行，去掉；heredoc 正文和 # 注释跳过；引号没闭合抛 ValueError。"""
+    out, cur, heredocs, subs = [], [], [], []
+    st = {"has": False, "q": False}
+    i, n = 0, len(cmd)
+
+    def end():
+        if st["has"]:
+            out.append(("".join(cur), st["q"]))
+        del cur[:]
+        st.update(has=False, q=False)
+
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if cmd.startswith("\\\n", i) or cmd.startswith("\\\r\n", i):
+                i += 2 if cmd[i + 1] == "\n" else 3
+            else:
+                cur.append(cmd[i + 1:i + 2])
+                st.update(has=True, q=True)
+                i += 2
+            continue
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                raise ValueError("引号没闭合")
+            cur.append(cmd[i + 1:j])
+            st.update(has=True, q=True)
+            i = j + 1
+            continue
+        if c == '"':
+            j = _expand(cmd, i + 1, subs, '"')
+            cur.append(re.sub(r'\\([\\"$`\n])', r"\1", cmd[i + 1:j]))
+            st.update(has=True, q=True)
+            i = j + 1
+            continue
+        if c == "#" and not st["has"]:                       # 注释到行尾
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in " \t\r":
+            end()
+            i += 1
+            continue
+        if c == "\n":
+            end()
+            out.append(("\n", None))
+            i += 1
+            for delim, strip_tabs, quoted in heredocs:
+                body_end, nxt = _skip_heredoc(cmd, i, delim, strip_tabs)
+                if not quoted:                               # <<EOF：正文里的命令替换会执行
+                    _expand(cmd[i:body_end], 0, subs, None)
+                i = nxt
+            heredocs = []
+            continue
+        op = next((o for o in OPS if cmd.startswith(o, i)), None)
+        if op:
+            end()
+            out.append((op, None))
+            i += len(op)
+            if op in ("<<", "<<-"):
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                w = _heredoc_word(cmd, i)
+                if w:
+                    heredocs.append((w[0], op == "<<-", w[1]))
+                    i = w[2]
+            continue
+        cur.append(c)
+        st["has"] = True
+        i += 1
+    end()
+    return out, subs
+
+
+def commands(toks):
+    """按分隔符切成一条条简单命令，每条是 [(词, 带没带引号)]；重定向运算符本身不算词。"""
+    cur = []
+    for t, q in toks:
+        if q is None:
+            if t in SEPS and cur:
+                yield cur
+                cur = []
+            continue
+        cur.append((t, q))
+    if cur:
+        yield cur
+
+
+def hit(words, depth):
+    if any(w in FREE and not q for w, q in words):
+        return False
+    for k, (w, _) in enumerate(words):
+        name = os.path.basename(w)
+        rest = words[k + 1:]
+        if name in TRIGGER and any(TRIGGER[name](x) for x, _ in rest):
+            return True
+        if name in SUBSHELLS:
+            for m in range(len(rest) - 1):
+                if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", rest[m][0]):
+                    if asks(rest[m + 1][0], depth + 1):
+                        return True
+                    break
+        if name == "eval" and asks(" ".join(x for x, _ in rest), depth + 1):
+            return True
+    return False
+
+
+def asks(cmd, depth=0):
+    if depth > 8:
+        return False
+    try:
+        toks, subs = tokens(cmd)
+    except ValueError:
+        return bool(re.search(CRUDE, cmd))
+    return (any(hit(words, depth) for words in commands(toks))
+            or any(asks(sub, depth + 1) for sub in subs))
+
+
+def main():
+    data = json.load(sys.stdin)
+    if data.get("tool_name") not in SHELL_TOOLS:
+        return
+    cmd = (data.get("tool_input") or {}).get("command") or ""
+    if asks(cmd):
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": REASON}}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

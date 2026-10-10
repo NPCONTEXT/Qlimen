@@ -1,0 +1,25 @@
+{
+  "说明": "Qlimen 派工的预算、价目、目录范围与外壳路径。install.sh 会把 {{…}} 换成你的路径，生成同目录的 预算.json。预算和调度只记录和提醒，不拦：日上限（deepseek_daily_cny、kimi_daily_calls）和超长上限（timeout_sec：不给 --timeout 时到点收工，给得更长只提醒）超了只在派工前和回执里提醒，用户批准高于预算。价格是 DeepSeek 官网高峰价（元/百万 tokens），估算偏高不偏低；Kimi 走会员额度，按次数记。数字按你自己的订阅改，改之前想清楚。",
+  "deepseek_daily_cny": 30,
+  "kimi_daily_calls": {"k3": 100, "k28": 200},
+  "apply_max_ops": 200,
+  "timeout_sec": 600,
+  "prices_cny_per_mtok": {
+    "flash": {"in": 2, "cache": 0.04, "out": 8}
+  },
+  "allow_roots": ["{{WORKSPACE}}"],
+  "deny_roots": ["{{QLIMEN_HOME}}/core/workers", "{{QLIMEN_HOME}}/core/data", "{{WORKSPACE}}/工人家.nosync"],
+  "shells": {
+    "dsh": "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+    "kimi": "~/.kimi-code/bin/kimi"
+  },
+  "dsh_patch": "{{QLIMEN_HOME}}/adapters/dsh/dsh-flash.patch.yml",
+  "ledger": "{{QLIMEN_HOME}}/core/data/用量日志.csv",
+  "results_dir": "{{QLIMEN_HOME}}/core/data/工人结果",
+  "kimi_sessions": "{{WORKSPACE}}/工人家.nosync/kimi/sessions",
+  "worker_homes": {
+    "说明": "工人的数据目录（DSH_HOME、KIMI_CODE_HOME）。放在工作区内，主模型在「只能写工作区」的沙箱里也能派工；.nosync 后缀让 iCloud 不同步它。里面要放两个壳的登录凭据副本（从 ~/.dsh、~/.kimi-code 复制，过期就重新复制），所以它在 deny_roots 里：工人不能被派进这个目录。",
+    "dsh": "{{WORKSPACE}}/工人家.nosync/dsh",
+    "kimi": "{{WORKSPACE}}/工人家.nosync/kimi"
+  }
+}

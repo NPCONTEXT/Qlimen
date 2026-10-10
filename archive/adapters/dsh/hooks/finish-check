@@ -1,0 +1,221 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""Stop 钩子：回合即将结束时做两项检查，只查「本会话动过的任务目录」（由 track 钩子按 session_id 记在
+/tmp/qlimen-sessions.json；本会话没动过任何任务目录就什么都不查）。每个任务目录内看深度 ≤3。
+2026-10-05 起：原先扫整个工作区，会把别的会话刚锁定的方案拿来拦本会话，故改为按会话。
+
+一、验收：头部状态为「已锁定 / 已交付」的 方案.md，且任务看起来做完了（状态是「已交付」，或同目录 TODO.md
+    已没有未勾选的 `- [ ]`），才跑 `verify --json --skip-cmd`；有失败项就阻塞结束。
+    TODO 还有没勾的项 = 任务明显在进行中（等批准、等用户操作都属正常停顿），放行不拦。
+    没有 TODO.md 的已锁定方案无法判断进度，照旧检查。
+    2026-10-05 起：原先每个中间回合都拦，任务每推进一项失败组合就变、计数清零，拦得过频。
+    同一方案同一组失败项最多阻塞 2 次。
+    cmd: 条目在钩子里不运行（2026-10-05 实测：钩子进程的写权限比会话小，`npm run check` 报 EPERM；
+    浏览器测试超过 60 秒；每回合都跑一遍要两分钟）。它们只在会话里跑 verify 时检查。
+二、交接：进行中的任务目录（有 TODO.md，且 方案.md 不是「已交付 / 已终止」）里，
+    交接.md 缺失，或比 TODO.md / 方案.md 旧 30 分钟以上，就阻塞一次，要求按
+    archive/core/flow/qlimen-flow/交接模板.md 补写。同一份 TODO / 方案状态只提醒一次。
+    这是在「上下文快满」之外的兜底：DSH 不支持 PreCompact 钩子，模型也看不到自己的上下文用量，
+    只能靠「任务状态变了，交接就要跟上」来保证随时能被接手。
+
+已归档的目录不查（2026-10-06 起）：目录里放一个名叫「已归档」的文件，两项检查都跳过它；名叫「备份」「归档」的
+    目录照旧跳过。不按名字的前后缀去猜：猜错成已归档，那个任务的检查就悄悄失效了。
+
+阻塞方式：exit 2 + stderr 原因，模型会被要求继续这一轮。状态记在 /tmp；读会话记录时加共享锁，
+自己的计数文件先写临时文件再替换。环境变量 QLIMEN_TMP 可把状态目录改到别处，只给自查用。
+出任何异常都放行（退出码 0），钩子坏了不能让会话卡死。
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+CORE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "core")
+VERIFY = os.path.join(CORE, "bin", "verify")
+TEMPLATE = os.path.join(CORE, "flow", "qlimen-flow", "交接模板.md")
+TMP = os.environ.get("QLIMEN_TMP") or "/tmp"
+STATE = os.path.join(TMP, "qlimen-finish-check.json")
+SESSIONS = os.path.join(TMP, "qlimen-sessions.json")  # track 钩子写入：{session_id: [任务目录, ...]}
+MAX_BLOCKS = 2
+HANDOFF_SLACK = 1800  # 秒：交接比 TODO / 方案旧这么久才提醒，免得每勾一项就被拦
+SKIP_DIRS = {"node_modules", ".git", "dist", "__pycache__", "Qlimen", "备份", "归档"}
+MARK = "已归档"  # 目录里有这个文件就不查
+
+
+def archived(d):
+    return os.path.exists(os.path.join(d, MARK))
+
+
+def task_dirs(root):
+    """深度 ≤3 的目录，跳过依赖、备份、已归档的、Qlimen 自身。"""
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")
+                   and not archived(os.path.join(d, x))]
+        if d.count(os.sep) - root_depth >= 3:
+            dirs[:] = []
+        yield d, files
+
+
+def head(path, n=600):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read(n)
+    except OSError:
+        return None
+
+
+def session_roots(sid):
+    """本会话动过的任务目录；读不到记录就返回空列表（宁可漏查，不跨会话误拦）。"""
+    if not sid:
+        return []
+    lock = None
+    try:
+        try:
+            lock = open(SESSIONS + ".lock", "a")
+            fcntl.flock(lock, fcntl.LOCK_SH)
+        except OSError:
+            lock = None  # 锁拿不到就照读：track 是整文件替换，读到的总是完整的一版
+        with open(SESSIONS, encoding="utf-8") as f:
+            dirs = json.load(f).get(sid, [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    finally:
+        if lock:
+            lock.close()
+    return [d for d in dirs if isinstance(d, str) and os.path.isdir(d) and not archived(d)]
+
+
+def walk_all(roots):
+    for r in roots:
+        yield from task_dirs(r)
+
+
+UNCHECKED = re.compile(r"^\s*[-*]\s+\[ \]", re.M)
+
+
+def looks_done(d, files, plan_head):
+    """任务是否「看起来做完了」：方案已交付，或 TODO.md 没有未勾选项；没有 TODO.md 视为无法判断 → 检查。"""
+    if re.search(r"状态：\s*已交付", plan_head):
+        return True
+    if "TODO.md" not in files:
+        return True
+    try:
+        with open(os.path.join(d, "TODO.md"), encoding="utf-8") as f:
+            return not UNCHECKED.search(f.read())
+    except OSError:
+        return True
+
+
+def locked_plans(roots):
+    out = []
+    for d, files in walk_all(roots):
+        if "方案.md" in files:
+            p = os.path.join(d, "方案.md")
+            h = head(p)
+            if h and re.search(r"状态：\s*已(锁定|交付)", h) and looks_done(d, files, h):
+                out.append(p)
+    return out
+
+
+def stale_handoffs(roots):
+    """返回 [(任务目录, 原因, 状态键)]；状态键随 TODO / 方案的修改时间变。"""
+    out = []
+    for d, files in walk_all(roots):
+        if "TODO.md" not in files:
+            continue
+        if "方案.md" in files:
+            h = head(os.path.join(d, "方案.md"))
+            if h is None or re.search(r"状态：\s*已(交付|终止)", h):
+                continue
+        srcs = [os.path.join(d, x) for x in ("TODO.md", "方案.md") if x in files]
+        newest = max(os.path.getmtime(p) for p in srcs)
+        ho = os.path.join(d, "交接.md")
+        if not os.path.isfile(ho):
+            why = "还没有 交接.md"
+        elif os.path.getmtime(ho) + HANDOFF_SLACK < newest:
+            why = "交接.md 比 TODO.md / 方案.md 旧了 30 分钟以上"
+        else:
+            continue
+        out.append((d, why, "handoff|%s|%d" % (d, int(newest))))
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def main():
+    data = json.load(sys.stdin)
+    cwd = data.get("cwd") or os.getcwd()
+    if not os.path.isdir(cwd) or cwd == os.path.expanduser("~"):
+        return 0
+    roots = session_roots(data.get("session_id"))
+    if not roots:
+        return 0
+    state = load_state()
+    msgs = []
+
+    reasons = []
+    for plan in locked_plans(roots):
+        r = subprocess.run([VERIFY, "--json", "--skip-cmd", plan], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=120)
+        try:
+            res = json.loads(r.stdout)
+        except ValueError:
+            continue
+        fails = [x for x in res.get("results", []) if x.get("status") == "失败"]
+        if not fails:
+            continue
+        key = hashlib.sha1((plan + "|" + "|".join(x["item"] for x in fails)).encode("utf-8")).hexdigest()
+        n = state.get(key, 0)
+        if n >= MAX_BLOCKS:
+            continue
+        state[key] = n + 1
+        lines = ["- %s —— %s" % (x["item"], x["note"]) for x in fails[:8]]
+        reasons.append("%s 有 %d 项验收未通过：\n%s" % (plan, len(fails), "\n".join(lines)))
+    if reasons:
+        msgs.append(
+            "【Qlimen 验收】已锁定的方案还有验收项未通过，不能报完成：\n" + "\n".join(reasons) +
+            "\n请继续修复；确实无法通过的，在汇报里逐条写明原因并标【进行中】。"
+            "（同一组失败最多拦 %d 次）" % MAX_BLOCKS)
+
+    stale = []
+    for d, why, key in stale_handoffs(roots):
+        k = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        if state.get(k):
+            continue
+        state[k] = 1
+        stale.append("- %s：%s" % (d, why))
+    if stale:
+        msgs.append(
+            "【Qlimen 交接】下面的任务还在进行中，交接没跟上：\n" + "\n".join(stale) +
+            "\n请按 %s 的格式写或更新该目录的 交接.md：停在哪、下一步、用户定下的事（含原话和随口的要求）、"
+            "查过的事实、踩过的坑、没验证的；写完再结束本轮。只提醒一次。" % TEMPLATE)
+
+    if not msgs:
+        return 0
+    try:
+        tmp = STATE + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+    sys.stderr.write("\n\n".join(msgs))
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        code = main()
+    except Exception:
+        code = 0
+    sys.exit(code)

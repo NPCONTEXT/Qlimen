@@ -1,0 +1,6 @@
+{"期望": "问", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "dsh headless -p '你好'"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}
+{"期望": "问", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "cd /tmp && kimi -p '读一下这个文件'"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}
+{"期望": "放行", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "ls -la"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}
+{"期望": "放行", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "{W} k28 --dir /tmp --tag t --plan '测' --task '不要用 dsh headless'"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}
+{"期望": "放行", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "dsh --help"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}
+{"期望": "放行", "输入": {"session_id": "t", "turn_id": "t", "tool_name": "apply_patch", "tool_use_id": "t", "tool_input": {"command": "dsh headless -p x"}, "cwd": "/tmp", "hook_event_name": "PreToolUse"}}

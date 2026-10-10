@@ -1,0 +1,42 @@
+#!/bin/bash
+# qlimen-lock：给「保护清单.txt」里的路径加 macOS 用户锁定标记（chflags uchg）。
+#   qlimen-lock            全部加锁
+#   qlimen-lock --status   查看每个路径当前是否加锁（不改任何东西）
+# 加锁后任何程序（包括 AI 工具）都不能修改、删除、改名这些文件；要改先运行 qlimen-unlock。
+# 注意：这是防「顺手改」的门禁，不防有意解锁（解锁不需要密码）。
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+LIST="$HERE/保护清单.txt"
+
+paths() {
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"; line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    line="${line/#\~/$HOME}"
+    # shellcheck disable=SC2086
+    for p in $line; do
+      [ -e "$p" ] || [ -L "$p" ] || { echo "  （不存在，跳过）$p" >&2; continue; }
+      printf '%s\n' "$p"
+    done
+  done < "$LIST"
+}
+
+is_locked() { ls -ldO "$1" 2>/dev/null | grep -q 'uchg'; }
+
+IFS=$'\n'
+if [ "${1:-}" = "--status" ]; then
+  n=0; m=0
+  for p in $(paths); do
+    n=$((n+1))
+    if is_locked "$p"; then m=$((m+1)); echo "  🔒 $p"; else echo "  🔓 $p"; fi
+  done
+  echo "[qlimen-lock] 已锁 $m / $n"
+  exit 0
+fi
+
+fail=0; n=0
+for p in $(paths); do
+  if chflags -h uchg "$p" 2>/dev/null; then n=$((n+1)); else echo "  ✗ 加锁失败：$p" >&2; fail=1; fi
+done
+echo "[qlimen-lock] 已加锁 $n 个路径"
+exit $fail

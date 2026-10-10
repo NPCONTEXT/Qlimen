@@ -1,0 +1,28 @@
+{
+  "description": "Qlimen：会话开始时送入 Codex 私有协议；guard：不经 waibao 直接调用 dsh 无头模式 / kimi -p 的命令弹框问用户。说明见 {{QLIMEN_HOME}}/adapters/codex/挂载说明.md",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/cat ~/.codex/private-protocol.md",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'{{QLIMEN_HOME}}/core/workers/guard'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,287 @@
+{
+ "说明": "guard 的测试样例。{W} = 被测 guard 同目录的 waibao 路径。「预期」写的是 2026-10-06 的旧行为（拦/放）；10-09 起「拦」改成「问」，由 测guard.py 统一换算，个别改了预期的见 测guard.py 的 CHANGED。",
+ "guard": [
+  {
+   "名": "直连壳 dsh",
+   "命令": "dsh headless -p '你好'",
+   "预期": "拦"
+  },
+  {
+   "名": "交接里的原命令",
+   "命令": "bash -c \"echo test\" && dsh headless -p '你好'",
+   "预期": "拦"
+  },
+  {
+   "名": "直连壳 kimi",
+   "命令": "kimi -p '你好'",
+   "预期": "拦"
+  },
+  {
+   "名": "派工后用分号拼接直连",
+   "命令": "{W} --status; dsh headless -p '你好'",
+   "预期": "拦"
+  },
+  {
+   "名": "普通命令 ls",
+   "命令": "ls -la ~/work/claude",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 dsh headless --help",
+   "命令": "dsh headless --help",
+   "预期": "放"
+  },
+  {
+   "名": "经脚本派工，任务文本里含壳名",
+   "命令": "{W} flash --dir ~/work/claude/样例项目 --tag 样例 --plan \"样例\" --task \"对比 dsh headless 和 kimi -p 两种写法的说明\"",
+   "预期": "放"
+  },
+  {
+   "名": "提示词中间带 -h",
+   "命令": "kimi -p \"解释一下 -h 参数是什么意思\"",
+   "预期": "拦"
+  },
+  {
+   "名": "提示词中间带 --version 和 --help",
+   "命令": "dsh headless -p \"对比 --version 和 --help 两个参数\"",
+   "预期": "拦"
+  },
+  {
+   "名": "提示词整个就是 -h（双引号）",
+   "命令": "kimi -p \"-h\"",
+   "预期": "拦"
+  },
+  {
+   "名": "提示词整个就是 --help（单引号）",
+   "命令": "kimi -p '--help'",
+   "预期": "拦"
+  },
+  {
+   "名": "子命令后跟带引号的 --help",
+   "命令": "dsh headless \"--help\"",
+   "预期": "拦",
+   "备注": "真 shell 里这是查帮助；旧版就拦，新版保持，宁可多拦"
+  },
+  {
+   "名": "提示词整个就是 -V（单引号）",
+   "命令": "dsh headless -p '-V'",
+   "预期": "拦"
+  },
+  {
+   "名": "续行：-p 在下一行",
+   "命令": "kimi -m kimi-code/k3 \\\n  -p \"你好\"",
+   "预期": "拦"
+  },
+  {
+   "名": "续行：壳名后直接换行",
+   "命令": "kimi \\\n -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "续行：三行",
+   "命令": "dsh \\\n headless \\\n -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "续行：下一行顶格",
+   "命令": "kimi \\\n-p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "续行：CRLF 换行",
+   "命令": "kimi \\\r\n -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "续行后跟查帮助参数",
+   "命令": "dsh headless \\\n--help",
+   "预期": "放",
+   "允许旧拦新放": true
+  },
+  {
+   "名": "续行后跟 --version（没有触发参数）",
+   "命令": "kimi \\\n --version",
+   "预期": "放"
+  },
+  {
+   "名": "引号里带分号",
+   "命令": "kimi -p \"第一步; 第二步\"",
+   "预期": "拦"
+  },
+  {
+   "名": "引号里带管道",
+   "命令": "kimi -p \"a | b\"",
+   "预期": "拦"
+  },
+  {
+   "名": "echo 的引号里出现壳名和触发词",
+   "命令": "echo \"x; dsh headless -p y\"",
+   "预期": "拦",
+   "备注": "按文本匹配的已知多拦"
+  },
+  {
+   "名": "引号里带分号，引号外带 --help",
+   "命令": "kimi -p \"a; b\" --help",
+   "预期": "放",
+   "允许旧拦新放": true
+  },
+  {
+   "名": "引号里带分号和 --help",
+   "命令": "kimi -p \"a; --help\"",
+   "预期": "拦"
+  },
+  {
+   "名": "引号里有真换行的多行提示词",
+   "命令": "kimi -p \"第一行\n第二行\"",
+   "预期": "拦"
+  },
+  {
+   "名": "bash -c 包一层",
+   "命令": "bash -c \"kimi -p hi\"",
+   "预期": "拦"
+  },
+  {
+   "名": "sh -c 单引号包一层",
+   "命令": "sh -c 'dsh headless -p hi'",
+   "预期": "拦"
+  },
+  {
+   "名": "带引号的全路径 dsh",
+   "命令": "\"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh\" headless -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "全路径 kimi",
+   "命令": "~/.kimi-code/bin/kimi -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "变量里放壳名",
+   "命令": "K=~/.kimi-code/bin/kimi; $K -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "管道后直连",
+   "命令": "cat a.txt | kimi -p \"总结\"",
+   "预期": "拦"
+  },
+  {
+   "名": "直连后接重定向和管道",
+   "命令": "dsh headless -p \"x\" 2>&1 | tee out.txt",
+   "预期": "拦"
+  },
+  {
+   "名": "heredoc 正文里出现壳名和触发词",
+   "命令": "cat > /tmp/a.md <<'EOF'\n说明 kimi -p 的用法\nEOF",
+   "预期": "拦",
+   "备注": "按文本匹配的已知多拦"
+  },
+  {
+   "名": "DSH 的小写工具名",
+   "命令": "kimi -p hi",
+   "工具": "bash",
+   "预期": "拦"
+  },
+  {
+   "名": "查帮助 -h",
+   "命令": "dsh headless -h",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 --help（kimi，带 -p）",
+   "命令": "kimi -p x --help",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 --version",
+   "命令": "dsh headless --version",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 -V（kimi，带 -p）",
+   "命令": "kimi -p x -V",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 --dump-config",
+   "命令": "dsh headless --dump-config",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 --dump-default-config",
+   "命令": "dsh headless --dump-default-config",
+   "预期": "放"
+  },
+  {
+   "名": "查帮助 --dump-config-schema",
+   "命令": "dsh headless --dump-config-schema",
+   "预期": "放"
+  },
+  {
+   "名": "引号没闭合，后面带 --help",
+   "命令": "kimi -p \"没闭合 --help",
+   "预期": "拦",
+   "备注": "旧版放行；真 shell 里这条根本跑不起来，新版宁可拦"
+  },
+  {
+   "名": "撇号没闭合，分号后直连",
+   "命令": "echo it's ok; kimi -p hi",
+   "预期": "拦"
+  },
+  {
+   "名": "waibao --status",
+   "命令": "{W} --status",
+   "预期": "放"
+  },
+  {
+   "名": "waibao 派 k3，任务文本里含壳名和触发词",
+   "命令": "{W} k3 --dir ~/work/claude/样例项目 --tag t --plan \"p\" --task \"kimi -p 和 dsh headless 的区别\"",
+   "预期": "放"
+  },
+  {
+   "名": "普通命令 git status",
+   "命令": "git status",
+   "预期": "放"
+  },
+  {
+   "名": "普通命令 grep",
+   "命令": "grep -rn \"TODO\" ~/work/claude/钩子修复",
+   "预期": "放"
+  },
+  {
+   "名": "普通命令 python -c",
+   "命令": "python3 -c \"print('hi')\"",
+   "预期": "放"
+  },
+  {
+   "名": "普通命令 重定向加 &&",
+   "命令": "echo hello > /tmp/x.txt && cat /tmp/x.txt",
+   "预期": "放"
+  },
+  {
+   "名": "路径里有 dsh 但没有触发词",
+   "命令": "ls ~/work/dsh/Qlimen/core/workers/",
+   "预期": "放"
+  },
+  {
+   "名": "路径里有 .kimi-code",
+   "命令": "cat ~/.kimi-code/config.toml | head -5",
+   "预期": "放"
+  },
+  {
+   "名": "不是 shell 工具",
+   "工具": "Write",
+   "输入": {
+    "file_path": "/tmp/a.md",
+    "content": "kimi -p hi 和 dsh headless"
+   },
+   "预期": "放"
+  },
+  {
+   "名": "子命令放进变量（故意绕，不管）",
+   "命令": "MODE=headless; dsh $MODE -p \"你好\"",
+   "预期": "放",
+   "备注": "已知不拦，方案明确不做"
+  }
+ ]
+}

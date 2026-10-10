@@ -1,0 +1,160 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""PreToolUse 钩子：记下「本会话动过哪些任务目录」，给 finish-check 用，让验收和交接提醒只管本会话的任务。
+
+只记写操作：write / edit 的 file_path；bash 只在命令像是写入（重定向、cp、mv、mkdir、touch、tee、rm、sed -i 等）时记。
+任务目录 = 路径所在「工作区根」下的第一层子目录（如 <工作区>/任务-xxx、<工作区>/某项目）。
+工作区根取自 core/workers/预算.json 的 allow_roots，和会话当时的 cwd 无关（2026-10-06 起：原先按 cwd 算，
+Claude Code 里 cd 进项目后会把「项目/子目录」当成任务目录）。预算.json 读不到时退回按 cwd 算。
+cwd 只用来把写文件工具给的相对路径拼成绝对路径；bash 命令里没写出工作区内路径的不记（宁可少记）。
+不记：隐藏目录、Qlimen、node_modules、名叫「备份」「归档」的、以 .nosync 结尾的、里面有「已归档」标记文件的。
+记录写在 /tmp/qlimen-sessions.json：{session_id: [目录, ...]}，读改写在文件锁里做。
+环境变量 QLIMEN_TMP 可把状态目录改到别处，只给自查用（钩子的环境变量来自应用，会话里的命令改不了）。
+只观察、永不阻塞；出任何异常都静默放行（退出码 0、无输出）。
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+
+HARNESS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+CFG = os.path.join(HARNESS, "core", "workers", "预算.json")
+TMP = os.environ.get("QLIMEN_TMP") or "/tmp"
+STATE = os.path.join(TMP, "qlimen-sessions.json")
+SKIP = {"Qlimen", "归档", "备份", "node_modules"}
+MARK = "已归档"
+WRITE_TOOLS = ("write", "edit", "Write", "Edit")
+SHELL_TOOLS = ("bash", "Bash")
+# 粗略判断一条 shell 命令会不会写文件；宁可少记，不把只读查看算成「动过」
+WRITE_HINT = re.compile(r"(?<![<>&0-9])>{1,2}(?![&=])|(?<![\w-])(cp|mv|mkdir|touch|tee|rm|rsync|install|ln)(?![\w-])"
+                        r"|sed\s+(-[a-zA-Z]*\s+)*-i|perl\s+-[a-zA-Z]*i")
+MKDIR = re.compile(r"(?<![\w-])mkdir(?![\w-])")
+TAIL = "。，；：、！？.,;:"  # 从命令里取出的路径，尾部的这些标点去掉
+PAIRS = {"）": "（", "」": "「", "』": "『", "】": "【", "》": "《", "”": "“", "’": "‘", "]": "["}
+
+
+def roots(cwd):
+    """返回（工作区根列表，是否来自配置）。读不到配置就退回 [cwd]，即原先的算法。"""
+    try:
+        with open(CFG, encoding="utf-8") as f:
+            raw = json.load(f).get("allow_roots") or []
+        rs = [os.path.normpath(os.path.expanduser(r)) for r in raw if isinstance(r, str)]
+        rs = sorted(set(r for r in rs if os.path.isabs(r)), key=len, reverse=True)
+    except (OSError, ValueError, AttributeError):
+        rs = []
+    if rs:
+        return rs, True
+    return [os.path.normpath(cwd)], False
+
+
+def task_dir(path, cwd, rs, making=False):
+    """把路径映射到它所在工作区根下的第一层子目录；不在任何根下、或属于不记的那几类，返回 None。"""
+    if not path:
+        return None
+    p = os.path.expanduser(path)
+    if not os.path.isabs(p):
+        p = os.path.join(cwd, p)
+    p = os.path.normpath(p)
+    for root in rs:
+        if not p.startswith(root + os.sep):
+            continue
+        parts = p[len(root) + 1:].split(os.sep)
+        first = parts[0]
+        if not first or first.startswith(".") or first in SKIP or first.endswith(".nosync"):
+            return None
+        d = os.path.join(root, first)
+        if os.path.isdir(d):
+            return None if os.path.exists(os.path.join(d, MARK)) else d
+        if os.path.lexists(d):
+            return None                      # 根下的散文件，不是任务目录
+        # 还不存在：路径更深（根/名字/…）或命令在建目录，才当成将要出现的任务目录
+        return d if (len(parts) > 1 or making) else None
+    return None
+
+
+def clean_tail(p):
+    """去掉路径尾部的句读；右括号、右引号只在路径里没有对应的左半边时才去。"""
+    while p:
+        c = p[-1]
+        if c in TAIL or (c in PAIRS and PAIRS[c] not in p):
+            p = p[:-1]
+            continue
+        break
+    return p
+
+
+def paths_in_command(cmd, rs):
+    """从命令里找出提到工作区根下路径的片段（绝对路径、~/、$HOME/、${HOME}/ 四种写法）。"""
+    home = os.path.expanduser("~")
+    out = []
+    for root in rs:
+        variants = {root: root}
+        if root.startswith(home + os.sep):
+            rest = root[len(home):]
+            for prefix in ("~", "$HOME", "${HOME}"):
+                variants[prefix + rest] = root
+        for v, real in variants.items():
+            for m in re.finditer(r"(?<![\w/.~$-])" + re.escape(v) + r"/[^\s'\"|;&<>)`]+", cmd):
+                s = clean_tail(real + m.group(0)[len(v):])
+                if s:
+                    out.append(s)
+    return out
+
+
+def main():
+    data = json.load(sys.stdin)
+    sid = data.get("session_id")
+    cwd = data.get("cwd") or os.getcwd()
+    if not sid or not os.path.isdir(cwd):
+        return
+    rs, from_cfg = roots(cwd)
+    if not from_cfg and os.path.normpath(cwd) == os.path.expanduser("~"):
+        return
+    tool = data.get("tool_name")
+    ti = data.get("tool_input") or {}
+    found = set()
+    if tool in WRITE_TOOLS:
+        d = task_dir(ti.get("file_path"), cwd, rs)
+        if d:
+            found.add(d)
+    elif tool in SHELL_TOOLS:
+        cmd = ti.get("command") or ""
+        if WRITE_HINT.search(cmd):
+            making = bool(MKDIR.search(cmd))
+            for p in paths_in_command(cmd, rs):
+                d = task_dir(p, cwd, rs, making)
+                if d:
+                    found.add(d)
+            wd = ti.get("workdir")
+            if wd:
+                d = task_dir(wd, cwd, rs)
+                if d:
+                    found.add(d)
+    if not found:
+        return
+    with open(STATE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE, encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        cur = set(state.get(sid) or [])
+        if found <= cur:
+            return
+        state[sid] = sorted(cur | found)
+        tmp = STATE + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, STATE)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

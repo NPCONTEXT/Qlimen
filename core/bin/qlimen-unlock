@@ -1,0 +1,20 @@
+#!/bin/bash
+# qlimen-unlock：解除「保护清单.txt」里全部路径的锁定标记。改完务必运行 qlimen-lock 重新加锁。
+# 本脚本应由用户本人在终端运行；AI 工具不得自行运行（协议第 7 节明文禁止；第 3 节：先说明、等批准）。
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+LIST="$HERE/保护清单.txt"
+
+IFS=$'\n'
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%%#*}"; line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -z "$line" ] && continue
+  line="${line/#\~/$HOME}"
+  # shellcheck disable=SC2086
+  for p in $line; do
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    chflags -h nouchg "$p" && n=$((n+1))
+  done
+done < "$LIST"
+echo "[qlimen-unlock] 已解锁 $n 个路径。改完运行：$HERE/qlimen-lock"

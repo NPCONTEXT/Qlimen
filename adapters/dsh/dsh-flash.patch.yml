@@ -1,0 +1,42 @@
+# dsh 无头工人的补丁层：改走桌面版同一条账号登录通道（deepseek-account），
+# 不需要 DEEPSEEK_API_KEY。用法：dsh headless --patch <本文件> ...
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+
+# 2026-10-06 工人加固：关掉工人用不着、又能把读到的东西带出去的工具。
+# 留下的只有 tool-fs（读文件、读图）和 tool-fs-search（找文件、搜内容）。
+# dsh 的沙箱只管写文件，管不了联网和读取，所以只能在这里关工具。
+# 下面的 id 是 dsh 基础组合里各工具行的 id；应用升级后如果改了名，这里会悄悄失效，
+# 由 waibao 兜底：flash 一旦调用了 read / read_image / glob / grep 以外的工具，当场中止。
+# 改完用「导出配置」核对（不调模型）：dsh headless --patch <本文件> --dump-config，看各行的 disabled。
+# 命令行
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+# 联网
+- id: tool-web
+  disabled: true
+# 子代理、工作流（能另起一个带全套工具的代理）
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+# 其余工人用不着的
+- id: tool-skill
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-todo
+  disabled: true

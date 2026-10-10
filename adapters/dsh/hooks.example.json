@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'{{QLIMEN_HOME}}/adapters/dsh/hooks/private-protocol'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'{{QLIMEN_HOME}}/adapters/dsh/hooks/intake'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'{{QLIMEN_HOME}}/core/workers/guard'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
