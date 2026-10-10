@@ -21,6 +21,22 @@ REPO = os.path.dirname(HERE)
 PY = sys.executable or "/usr/bin/python3"
 
 
+# waibao 的系统沙箱（sandbox-exec）本来就放行这两处临时目录。仓库要是放在这里，
+# 「写不进」那几项测不出来，「/tmp 不在允许范围」那项也会变成「包含禁区」，所以沙盒要换个地方建。
+TEMP_ROOTS = ("/private/tmp", "/private/var/folders")
+
+
+def sandbox_parent():
+    here = os.path.realpath(HERE)
+    if not any(here == t or here.startswith(t + "/") for t in TEMP_ROOTS):
+        return HERE, "_沙盒-"
+    alt = os.path.expanduser("~/Library/Caches" if sys.platform == "darwin" else "~")
+    os.makedirs(alt, exist_ok=True)
+    print("提醒：仓库在系统临时目录里（%s）。waibao 的系统沙箱本来就放行临时目录，在这里测不准，"
+          "测试沙盒改建在 %s 下，测完删掉。" % (here, alt), flush=True)
+    return alt, "qlimen-测试沙盒-"
+
+
 def unlock(path):
     """清掉 macOS 的用户锁定标记（只作用于测试沙盒）。不是 macOS 时什么都不做。"""
     if sys.platform == "darwin" and os.path.exists(path):
@@ -36,7 +52,8 @@ def fill(src, dst, home, ws):
 
 def main():
     # 沙盒建在 tests/ 下，不放系统临时目录：系统沙箱规则本来就放行临时目录，放那里测不出「写不进」
-    tmp = tempfile.mkdtemp(prefix="_沙盒-", dir=HERE)
+    parent, prefix = sandbox_parent()
+    tmp = tempfile.mkdtemp(prefix=prefix, dir=parent)
     ws = os.path.join(tmp, "工作区")
     home = os.path.join(ws, "Qlimen")
     try:
