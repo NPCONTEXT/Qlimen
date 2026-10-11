@@ -1,4 +1,4 @@
-![Qlimen 封面](docs/cover.png)
+![Qlimen 封面](docs/cover.jpg)
 
 <sub>封面图由 GPT-image-2 生成。</sub>
 
