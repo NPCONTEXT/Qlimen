@@ -16,11 +16,11 @@
 
 ## 一张长图看懂
 
-![Qlimen 是什么](docs/科普图/01-Qlimen是什么.png)
-![Qlimen 怎么工作](docs/科普图/02-Qlimen怎么工作.png)
-![Qlimen 有什么好处](docs/科普图/03-Qlimen有什么好处.png)
-![Qlimen 实测效果](docs/科普图/04-Qlimen实测效果.png)
-![Qlimen 适合谁](docs/科普图/05-Qlimen适合谁.png)
+![Qlimen 是什么](docs/科普图/01-Qlimen是什么.jpg)
+![Qlimen 怎么工作](docs/科普图/02-Qlimen怎么工作.jpg)
+![Qlimen 有什么好处](docs/科普图/03-Qlimen有什么好处.jpg)
+![Qlimen 实测效果](docs/科普图/04-Qlimen实测效果.jpg)
+![Qlimen 适合谁](docs/科普图/05-Qlimen适合谁.jpg)
 
 <sub>五张图由 GPT-image-2 生成。</sub>
 
