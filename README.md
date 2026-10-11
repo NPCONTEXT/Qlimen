@@ -14,6 +14,16 @@
 
 ---
 
+## 一张长图看懂
+
+![Qlimen 是什么](docs/科普图/01-Qlimen是什么.png)
+![Qlimen 怎么工作](docs/科普图/02-Qlimen怎么工作.png)
+![Qlimen 有什么好处](docs/科普图/03-Qlimen有什么好处.png)
+![Qlimen 实测效果](docs/科普图/04-Qlimen实测效果.png)
+![Qlimen 适合谁](docs/科普图/05-Qlimen适合谁.png)
+
+<sub>五张图由 GPT-image-2 生成。</sub>
+
 ## 30 秒看懂
 
 Qlimen 就四样东西：
@@ -253,7 +263,7 @@ adapters/                   Claude Code、Codex、DSH、kimi-code 怎么接
 examples/                   私有协议示例、任务目录三件套样例、工人回执样例（都已脱敏）
 tests/                      不调模型的自动测试
 tools/统计/                 用你自己的会话记录复现实测指标的脚本
-docs/                       架构、设计取舍、实测记录、协议来历、封面图
+docs/                       架构、设计取舍、实测记录、协议来历、封面图、科普图
 archive/                    瘦身时砍下来的部件：流程 skill、5 本作业手册、验收和收尾钩子
 install.sh                  安装脚本（默认只预演）
 ```
