@@ -8,6 +8,7 @@
   2. Codex 格式（tests/codex/跑验收.py）：guard 吃 Codex 的钩子输入
   3. waibao（tests/waibao/跑测试.py）：假工人 + 临时账本，测派工、越界审计、预算提醒、超时、apply/undo 等
   4. 统计脚本（tools/统计/自测.py）：用造出来的假会话记录测 tools/统计/统计.py 的口径和隐私（汇总表不含原文）
+  5. doccheck（tests/doccheck/测doccheck.py）：三件套上限、表格断开、编号重复、索引引用、提醒频率
 只依赖系统自带的 Python 3（3.9 起）。退出码：全过 0，否则 1。
 """
 import os
@@ -71,7 +72,8 @@ def main():
         runs = [("guard", [PY, os.path.join(HERE, "guard/测guard.py"), "--target", guard]),
                 ("Codex 格式", [PY, os.path.join(HERE, "codex/跑验收.py"), "--target", guard]),
                 ("waibao", [PY, os.path.join(HERE, "waibao/跑测试.py"), "--target", os.path.join(home, "core/workers/waibao")]),
-                ("统计脚本", [PY, os.path.join(REPO, "tools/统计/自测.py")])]
+                ("统计脚本", [PY, os.path.join(REPO, "tools/统计/自测.py")]),
+                ("doccheck", [PY, os.path.join(HERE, "doccheck/测doccheck.py"), "--target", os.path.join(home, "core/workers/doccheck")])]
         results = []
         for name, cmd in runs:
             print("\n========== %s ==========" % name, flush=True)

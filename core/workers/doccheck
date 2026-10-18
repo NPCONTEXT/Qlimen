@@ -1,0 +1,276 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""三件套和任务索引检查（2026-10-18）。PostToolUse 钩子（Claude Code hooks.json 方言），也能在命令行跑。
+
+钩子模式（stdin 是钩子输入）：Write / Edit / MultiEdit 看 tool_input.file_path；Bash 从命令里认出
+TODO.md、交接.md、方案.md、索引.md、接手索引.md 的路径（相对路径按 cwd 算；同一条命令里的 D=… 会代进 $D），
+只认 60 秒内改动过的，grep、cat 这类只读命令不提醒。
+被改到的文件有问题，就输出 additionalContext 提醒模型（同一个文件 30 分钟内只提醒一次）；没问题不输出。
+命令行模式：doccheck 文件或目录……，列出问题；退出码 0 = 没问题，1 = 有问题。
+
+查什么（规则见核心协议 §6）：
+- 字数（按字符）：TODO.md 8000、交接.md 1 万、方案.md 1.2 万；索引 3000。
+- 表格：表格中间夹了非表格行（一格里塞了换行，表格从这里断开）；某行的格数和表头不同；
+  TODO.md 里表格一行不超过 300 字，表头第一格是「编号」的表里编号不能重复。
+- 索引：反引号里带「/」或以 .md 结尾的路径要存在（先按索引所在目录算，再按上一级算）；
+  「`X.md` §小节」的小节要存在（「§三」对「## 三、」，「§2」对「## 2.」，其余按标题里含这几个字算）。
+- 归档/ 里的不查。认不出路径的（比如 Python 里拼出来的）就不查，不保证查全。
+出任何异常都放行（退出码 0、无输出）：不能因为钩子坏了让命令跑不了。
+"""
+import json
+import os
+import re
+import sys
+import time
+
+LIMITS = {"TODO.md": 8000, "交接.md": 10000, "方案.md": 12000}
+INDEX_NAMES = ("索引.md", "接手索引.md")
+INDEX_LIMIT = 3000
+ROW_LIMIT = 300
+QUIET_SECONDS = 30 * 60
+FRESH_SECONDS = 60
+HOME = os.path.expanduser("~")
+NAMES = tuple(LIMITS) + INDEX_NAMES
+EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
+SHELL_TOOLS = ("Bash", "bash")
+STATE = os.environ.get("QLIMEN_DOCCHECK_STATE") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "data", "doccheck-提醒记录.json")
+
+PATH_RE = re.compile(r"[^\s'\"`=()<>|;&,，：]*(?:TODO|交接|方案|索引)\.md")
+DELIM = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+SECTION = r"§([^\s，。；、（）()`→]+)"
+NUMERALS = "一二三四五六七八九十"
+ADVICE = ("处理办法（核心协议 §6）：历史（旧交接、做完的阶段、被替换的方案）挪进同目录 归档/，主文件留一行索引；"
+          "表格一格只写一行；索引只写出处，引用要真实存在。改完告诉用户一句；这次不方便处理，就告诉用户原因。")
+
+
+def wanted(path):
+    return os.path.basename(path) in NAMES and "/归档/" not in path.replace(os.sep, "/") + "/"
+
+
+def cells(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip() for c in re.split(r"(?<!\\)\|", s)]
+
+
+def is_row(line):
+    return "|" in line and not DELIM.match(line)
+
+
+def table_problems(text, is_todo):
+    lines = text.split("\n")
+    probs = []
+    i = 0
+    in_code = False
+    while i < len(lines):
+        if lines[i].strip().startswith("```"):
+            in_code = not in_code
+        if in_code or "|" not in lines[i] or i + 1 >= len(lines) or not DELIM.match(lines[i + 1]):
+            i += 1
+            continue
+        head = cells(lines[i])
+        seen = {}
+        j = i + 2
+        while j < len(lines):
+            row = lines[j]
+            if row.strip().startswith("```"):
+                break
+            if is_row(row):
+                c = cells(row)
+                if len(c) != len(head):
+                    probs.append("第 %d 行有 %d 格，表头是 %d 格" % (j + 1, len(c), len(head)))
+                if is_todo and len(row) > ROW_LIMIT:
+                    probs.append("第 %d 行有 %d 字，表格一行不超过 %d 字" % (j + 1, len(row), ROW_LIMIT))
+                if is_todo and head and head[0] == "编号" and c and c[0]:
+                    num = re.sub(r"^\[[ xX]\]\s*", "", c[0]).strip()
+                    if num in seen:
+                        probs.append("编号 %s 重复（第 %d 行、第 %d 行）" % (num, seen[num], j + 1))
+                    else:
+                        seen[num] = j + 1
+                j += 1
+                continue
+            if not row.strip():
+                break
+            k = j
+            while k < len(lines) and lines[k].strip() and not is_row(lines[k]):
+                k += 1
+            if k < len(lines) and is_row(lines[k]) and not (k + 1 < len(lines) and DELIM.match(lines[k + 1])):
+                probs.append("第 %d 行夹在表格中间，表格从这里断开（一格里别换行、别写列表）" % (j + 1))
+                j = k
+                continue
+            break
+        i = j
+    return probs
+
+
+def has_section(path, sec):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            heads = [l.strip() for l in f if l.startswith("#")]
+    except OSError:
+        return False
+    if all(ch in NUMERALS for ch in sec) or sec.isdigit():
+        return any(re.match(r"^#+\s*%s[、.．]" % re.escape(sec), h) for h in heads)
+    return any(sec in h for h in heads)
+
+
+def index_problems(path, text):
+    base = os.path.dirname(os.path.abspath(path))
+    up = os.path.dirname(base)
+    probs = []
+
+    def resolve(tok):
+        if tok.startswith(("~", "/")):
+            p = os.path.expanduser(tok)
+            return p if os.path.exists(p) else None
+        for b in (base, up):
+            p = os.path.join(b, tok)
+            if os.path.exists(p):
+                return p
+        return None
+
+    for no, line in enumerate(text.split("\n"), 1):
+        cur = None
+        for m in re.finditer(r"`([^`]+)`|" + SECTION, line):
+            tok = m.group(1)
+            if tok is not None:
+                # 命令（带空格）、占位符和通配（<目录>、*）、网址式路径（/api/…）都不是要走的桥
+                if " " in tok or any(ch in tok for ch in "<>*{}") or ("/" not in tok and not tok.endswith(".md")):
+                    continue
+                if tok.startswith("/") and not tok.startswith(HOME):
+                    continue
+                p = resolve(tok)
+                if p is None:
+                    probs.append("第 %d 行引用的 `%s` 不存在" % (no, tok))
+                cur = p if p and p.endswith(".md") else None
+            elif cur and not has_section(cur, m.group(2)):
+                probs.append("第 %d 行引用的 %s §%s 找不到" % (no, os.path.basename(cur), m.group(2)))
+    return probs
+
+
+def problems(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    name = os.path.basename(path)
+    limit = INDEX_LIMIT if name in INDEX_NAMES else LIMITS.get(name)
+    probs = []
+    if limit and len(text) > limit:
+        probs.append("有 %d 字，超过上限 %d 字" % (len(text), limit))
+    probs += table_problems(text, name == "TODO.md")
+    if name in INDEX_NAMES:
+        probs += index_problems(path, text)
+    return probs
+
+
+def from_command(cmd, cwd):
+    assigns = {var: val for var, _, val in re.findall(r"\b([A-Za-z_]\w*)=([\"']?)([^\s\"';]+)\2", cmd)}
+
+    def expand(tok):
+        tok = re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda m: assigns.get(m.group(1) or m.group(2), m.group(0)), tok)
+        return os.path.expanduser(tok)
+
+    dirs = [expand(d) for d in re.findall(r"['\"]((?:/|~/)[^'\"\n]*/)['\"]", cmd)]
+    out = []
+    for tok in PATH_RE.findall(cmd):
+        tok = expand(tok)
+        if "$" in tok:
+            continue
+        cands = [tok] if os.path.isabs(tok) else [os.path.join(cwd, tok)]
+        if "/" not in tok:
+            cands += [os.path.join(d, tok) for d in dirs]
+        out += [c for c in cands if os.path.isfile(c)]
+    return out
+
+
+def touched(data):
+    tool = data.get("tool_name")
+    inp = data.get("tool_input") or {}
+    cwd = data.get("cwd") or os.getcwd()
+    if tool in EDIT_TOOLS:
+        p = inp.get("file_path") or ""
+        paths = [p if os.path.isabs(p) else os.path.join(cwd, p)]
+    elif tool in SHELL_TOOLS:
+        # 只认这条命令改过的文件（60 秒内改动过）：grep、cat 这类只读的不提醒
+        now = time.time()
+        paths = [p for p in from_command(inp.get("command") or "", cwd) if now - os.path.getmtime(p) <= FRESH_SECONDS]
+    else:
+        return []
+    seen, out = set(), []
+    for p in paths:
+        p = os.path.normpath(p)
+        if p not in seen and wanted(p) and os.path.isfile(p):
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def hook():
+    data = json.load(sys.stdin)
+    state = load_state()
+    now = time.time()
+    cwd = data.get("cwd") or os.getcwd()
+    parts = []
+    for p in touched(data)[:3]:
+        probs = problems(p)
+        if not probs or now - state.get(p, 0) < QUIET_SECONDS:
+            continue
+        state[p] = now
+        shown = os.path.relpath(p, cwd) if p.startswith(cwd.rstrip("/") + "/") else p
+        more = "；另有 %d 处" % (len(probs) - 5) if len(probs) > 5 else ""
+        parts.append("- %s：%s%s" % (shown, "；".join(probs[:5]), more))
+    if parts:
+        save_state(state)
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "Qlimen 三件套检查发现问题：\n" + "\n".join(parts) + "\n" + ADVICE}},
+            ensure_ascii=False))
+
+
+def cli(args):
+    files = []
+    for a in args:
+        if os.path.isdir(a):
+            for d, sub, fs in os.walk(a):
+                sub[:] = [s for s in sub if s not in ("归档", "node_modules", ".git")]
+                files += [os.path.join(d, f) for f in fs if f in NAMES]
+        elif os.path.isfile(a):
+            files.append(a)
+    bad = 0
+    for p in sorted(files):
+        if not wanted(os.path.abspath(p)):
+            continue
+        for prob in problems(p):
+            print("%s：%s" % (p, prob))
+            bad = 1
+    return bad
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
+    try:
+        hook()
+    except Exception:
+        pass
+    sys.exit(0)

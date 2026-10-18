@@ -34,6 +34,7 @@ Qlimen 就四样东西：
 4. **一个兜底的安全底座**：
    - 加锁（`qlimen-lock`）
    - guard 钩子：不经派工脚本直接调用别的模型时，弹框问用户
+   - doccheck 钩子：改到 TODO、交接、方案、索引时，查长度上限、表格断开、索引引用（2026-10-18 加，只在 Claude Code 实测过）
    - 派工脚本 `waibao`：工人默认只读、联网和读本地二选一、越界审计、记账
 
 它很轻：一份协议加几个只依赖系统 Python 的脚本，接进你现有的代理就能用，不用换工具，也不用起服务。
@@ -187,6 +188,7 @@ Qlimen 不给模型新的专业能力。它做的是用几条通用规则约束�
 |---|---|---|
 | guard | 100 条 | 各种命令写法该放行还是该问：单双引号、heredoc、注释、续行、`$( )` 和反引号（含双引号和 heredoc 里的）、`eval`、`env`/`nohup`/`timeout` 前缀等 |
 | Codex 格式 | 6 条 | guard 能吃 Codex 的钩子输入 |
+| doccheck | 27 条 | 三件套上限、表格断开、TODO 编号重复、索引引用存在、Bash 命令里认路径、只读命令不提醒、提醒频率、出错放行 |
 | waibao | 142 项 | 假工人 + 临时账本：工人档案、越界审计、工具报警、预算提醒、超时、写结果文件夹的系统沙箱、apply/undo（撤销前整份预审）、同一秒派工不互相覆盖等 |
 | 统计脚本 | 23 项 | 用造出来的假会话记录测 [tools/统计/](tools/统计/说明.md) 的口径，并确认汇总表里不含对话原文和路径 |
 
@@ -256,7 +258,7 @@ python3 tests/跑全部测试.py                       # 不调模型的自测
 
 ```
 core/rules/AGENTS.md        核心协议
-core/workers/               waibao 派工脚本、guard 钩子、工人守则和档案、预算模板、自查记录
+core/workers/               waibao 派工脚本、guard 和 doccheck 钩子、工人守则和档案、预算模板、自查记录
 core/bin/                   qlimen-lock / qlimen-unlock、保护清单模板
 core/skills/waibao/         工人名册（skill）和派工的坑
 adapters/                   Claude Code、Codex、DSH、kimi-code 怎么接

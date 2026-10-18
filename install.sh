@@ -78,7 +78,7 @@ for d in "${DIRS[@]}"; do
   say "新建 $d"
   [ $APPLY = 1 ] && mkdir -p "$d"
 done
-EXE=("$QLIMEN_HOME/core/workers/waibao" "$QLIMEN_HOME/core/workers/guard" "$QLIMEN_HOME/core/bin/qlimen-lock"
+EXE=("$QLIMEN_HOME/core/workers/waibao" "$QLIMEN_HOME/core/workers/guard" "$QLIMEN_HOME/core/workers/doccheck" "$QLIMEN_HOME/core/bin/qlimen-lock"
      "$QLIMEN_HOME/core/bin/qlimen-unlock" "$QLIMEN_HOME/adapters/dsh/hooks/intake" "$QLIMEN_HOME/adapters/dsh/hooks/private-protocol")
 say "给 ${#EXE[@]} 个脚本加可执行权限"
 [ $APPLY = 1 ] && chmod +x "${EXE[@]}"
@@ -123,7 +123,8 @@ cat <<EOF
        @~/.claude/private-protocol.md
   2) 私有协议起步：cp "$QLIMEN_HOME/examples/私有协议/claude-code.md" ~/.claude/private-protocol.md，再按你的情况改
   3) ~/.claude/settings.json 里并进下面两段（已有 hooks / permissions 的话合并进去）：
-       "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "'$QLIMEN_HOME/core/workers/guard'", "timeout": 5 } ] } ] }
+       "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "'$QLIMEN_HOME/core/workers/guard'", "timeout": 5 } ] } ],
+                  "PostToolUse": [ { "matcher": "Write|Edit|MultiEdit|Bash", "hooks": [ { "type": "command", "command": "'$QLIMEN_HOME/core/workers/doccheck'", "timeout": 5 } ] } ] }
        "permissions": { "allow": [ "Bash($QLIMEN_HOME/core/workers/waibao *)" ] }
 
 【Codex】
