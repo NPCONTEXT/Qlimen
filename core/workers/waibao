@@ -14,6 +14,8 @@
 模型：flash 走 dsh（沙箱只读，补丁关掉命令行和联网）；k3 / k28 走 kimi（工具白名单：默认本地只读，--web 换成只联网，
 --out 换成读本地 + 只写结果文件夹，写入另由系统沙箱限定在那个文件夹）。
 读本地文件的工人不给联网，联网的工人不给读本地文件；工人用了名单以外的工具当场中止，读过的工作目录以外的路径列在回执里。
+两种误报不再判严重（2026-10-20）：kimi 把大输出存进会话目录的 tool-results 后工人读回来，不算越界；--out 工人往
+系统临时目录写草稿，不中止，只记一条普通越界，读回来不再记。
 预算只记账和提醒，不拦（2026-10-09 用户定）：日上限、超长上限（不给 --timeout 时的时限）超了只在派工前和回执里提醒。
 预算、价目、目录范围、外壳与账本路径都在同目录 预算.json。退出码：0 完成，2 被拒绝，3 失败/超时/越界。
 只依赖系统自带的 Python 3.9 标准库。
@@ -73,6 +75,9 @@ PROFILES = {
                    "tools": ("Read", "Grep", "Glob", "ReadMediaFile", "Write")},
 }
 WRITE_TOOLS = ("Write",)
+# 系统临时目录（2026-10-20）：--out 工人用 Write 往这里写草稿，系统沙箱本来就放行，不当场停掉，事后记一条普通越界。
+# 只认 /private/tmp 和各用户的临时目录（/private/var/folders/xx/xxxx/T/），同级的缓存目录（…/C/）不算。
+TEMP_WRITE = re.compile(r"^/private/tmp(/|$)|^/private/var/folders/[^/]+/[^/]+/T(/|$)", re.I)
 SANDBOX = "/usr/bin/sandbox-exec"
 # 联网工人的工作目录：一个专用的空目录，在派工范围内、不在禁区里。
 WEB_DIR = os.path.join(os.path.dirname(BASE), "联网工作目录.nosync")
@@ -292,6 +297,22 @@ def _write_ok(name, args, cwd, out):
     return True
 
 
+def _write_tmp(name, args, cwd):
+    """写文件的调用是不是全部落在系统临时目录里（见 TEMP_WRITE）；判不出路径也算不是。"""
+    paths = _targets(name, args)
+    if not paths:
+        return False
+    for p in paths:
+        if "\x00" in p:
+            return False
+        full = os.path.expanduser(p)
+        if not os.path.isabs(full):
+            full = os.path.join(cwd or "/", full)
+        if not TEMP_WRITE.match(os.path.realpath(full)):
+            return False
+    return True
+
+
 def _alarm(ev, allowed, kill, flag, cwd=None, out=None):
     """工人用了名单以外的工具、或往结果文件夹以外写，就当场中止。自己出错只记一笔，不拖累读输出的循环。"""
     try:
@@ -299,7 +320,7 @@ def _alarm(ev, allowed, kill, flag, cwd=None, out=None):
         for n, args in _calls(ev):
             if n not in allowed:
                 bad.append(str(n))
-            elif n in WRITE_TOOLS and not _write_ok(n, args, cwd, out):
+            elif n in WRITE_TOOLS and not (_write_ok(n, args, cwd, out) or (out and _write_tmp(n, args, cwd))):
                 bad.append("%s（写到结果文件夹以外，或判不出写到哪）" % n)
         if bad:                                              # 同一条消息里的全部记下再杀
             flag.setdefault("bad", []).extend(bad)
@@ -494,6 +515,58 @@ def _where(path, cwd, cfg):
     return "普通"
 
 
+def _abs_key(path, cwd):
+    """换成真实路径（相对路径按工作目录算），再按 _key 归一。"""
+    if "\x00" in path:
+        raise ValueError("路径里有空字符")
+    full = os.path.expanduser(path)
+    if not os.path.isabs(full):
+        full = os.path.join(cwd, full)
+    return _key(os.path.realpath(full))
+
+
+def _call_ids(rawpath):
+    """这次原始记录里 kimi 发出过的工具调用：{(工具名, 调用 id)}，都按 _key 归一。"""
+    ids = set()
+    with open(rawpath, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            tcs = ev.get("tool_calls") if isinstance(ev, dict) else None
+            for tc in tcs if isinstance(tcs, list) else []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                name = fn.get("name") if isinstance(fn, dict) else None
+                if isinstance(name, str) and isinstance(tc.get("id"), str):
+                    ids.add((_key(name), _key(tc["id"])))
+    return ids
+
+
+# kimi 的大输出存档：单次工具输出太长时，kimi 把全文存成
+# <会话目录>/<工作区>/<会话>/agents/main/tool-results/<工具名>-<调用 id>-<uuid>.txt，再提示工人用 Read 分页读。
+SAVED_NAME = re.compile(r"^(\w+)-(.+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$")
+
+
+def _saved_output(k, ids):
+    """k（归一过的真实路径）是不是这次会话的大输出存档：形状对，且工具名和调用 id 在这次原始记录里出现过。
+    别的会话的存档（调用 id 对不上）、工人家里的凭据（形状不对）照旧按禁区算。"""
+    root = _key(_real(KIMI_SESSIONS))
+    if not _inside(k, root) or k == root:
+        return False
+    rel = k[len(root):].lstrip(os.sep).split(os.sep)
+    if len(rel) != 6 or rel[2:5] != ["agents", "main", "tool-results"]:
+        return False
+    m = SAVED_NAME.match(rel[5])
+    return bool(m) and (m.group(1), m.group(2)) in ids
+
+
+def _own_file(path, cwd, ids, own):
+    """读的是不是这次工人自己的东西：kimi 替它存的大输出，或它这次写到临时目录的草稿（own）。"""
+    k = _abs_key(path, cwd)
+    return k in own or _saved_output(k, ids)
+
+
 def _glob_dir(pattern):
     """通配符写法里能确定的目录那一段（"" 表示就在起点目录）；判不了返回 None。"""
     if pattern.startswith(("{", "[")):
@@ -561,6 +634,7 @@ def read_audit(rawpath, cwd, cfg, allowed, out=None):
     """工人读过哪些工作目录以外的地方、用过哪些名单以外的工具、往结果文件夹以外写过什么。
     返回（给人看的行，有没有严重的）。"""
     lines, seen, serious = [], set(), False
+    ids, own = _call_ids(rawpath), set()             # 这次发出过的工具调用；这次写到临时目录的文件
 
     def add(mark, kind, name, what):
         line = "%s %s %s: %s" % (mark, kind, name, what)
@@ -582,13 +656,21 @@ def read_audit(rawpath, cwd, cfg, allowed, out=None):
                 if name in WEB_TOOLS:                        # 联网的由 web_audit 列
                     continue
                 if name in WRITE_TOOLS:
-                    if not _write_ok(name, args, cwd, out):
+                    if _write_ok(name, args, cwd, out):
+                        pass
+                    elif out and _write_tmp(name, args, cwd):    # 系统临时目录：沙箱本来就放行，记一条普通越界，读回来不再记
+                        for p in _targets(name, args):
+                            own.add(_abs_key(p, cwd))
+                            add(" ", "写到临时目录", name, p)
+                    else:
                         serious = True
                         add("‼", "写到结果文件夹以外", name, _short(args))
                     continue
                 paths = _targets(name, args)
                 for p in paths or []:
                     try:
+                        if _own_file(p, cwd, ids, own):         # kimi 替它存的大输出、它这次写到临时目录的草稿
+                            continue
                         w = _where(p, cwd, cfg)
                     except (ValueError, OSError):
                         paths = None

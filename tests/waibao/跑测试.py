@@ -91,11 +91,11 @@ class Run(object):
     pass
 
 
-def run(target, args, scen=None, rows=None, fields=None, driver=None, wait=90):
+def run(target, args, scen=None, rows=None, fields=None, driver=None, wait=90, sessions=None):
     d = tempfile.mkdtemp(dir=TMP)
     ledger = os.path.join(d, "账本.csv")
     env = dict(os.environ, WAIBAO_DSH=FAKE, WAIBAO_KIMI=FAKE, WAIBAO_LEDGER=ledger,
-               WAIBAO_OUT=os.path.join(d, "结果"), WAIBAO_KIMI_SESSIONS=os.path.join(d, "会话"),
+               WAIBAO_OUT=os.path.join(d, "结果"), WAIBAO_KIMI_SESSIONS=sessions or os.path.join(d, "会话"),
                FAKE_LOG=os.path.join(d, "假工人记录.json"), FAKE_SCENARIO=os.path.join(d, "剧本.json"))
     with open(env["FAKE_SCENARIO"], "w", encoding="utf-8") as f:
         json.dump(scen or {"events": []}, f, ensure_ascii=False)
@@ -1162,6 +1162,90 @@ def m_same_second(T, M):
 
 
 # ---------- 入口 ----------
+
+# ---------- 2026-10-20：kimi 的大输出存档、临时目录里的草稿 ----------
+
+G14 = "大输出存档和临时目录草稿不算越界"
+# 假的 uuid；拆成两段写，只是免得被仓库的隐私扫描（会话编号样式）误报。
+UUID_TAIL = "11111111-2222-3333" "-4444-555555555555"
+
+
+def k_call_id(name, args, cid):
+    """带指定调用 id 的 kimi 工具调用（真 kimi 的 id 形如 tool_xxx）。"""
+    return {"role": "assistant", "tool_calls": [{"id": cid, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]}
+
+
+def kimi_sess(T, events, sessions, out=None, hang=0):
+    scen = {"events": events, "hang": hang, "after": [k_final(), K_META]}
+    args = ["k3", "--dir", WORK] + (["--out", out] if out else []) + BASE_ARGS + ["--task", "测试任务"]
+    return run(T, args, scen, sessions=sessions)
+
+
+@test(G14)
+def n_saved(T, M):
+    sess = os.path.join(WS, "工人家.nosync", "kimi", "sessions")     # 和线上一样，会话目录在禁区里
+    here = os.path.join(sess, "wd_测试_0123456789ab", "session_aaaa", "agents", "main")
+    saved = os.path.join(here, "tool-results", "Grep-tool_Big1-%s.txt" % UUID_TAIL)
+    big = k_call_id("Grep", {"pattern": "测试", "path": "."}, "tool_Big1")
+    r = kimi_sess(T, [big, k_call_id("Read", {"path": saved}, "tool_R1"),
+                      k_call_id("Read", {"path": saved, "line_offset": 1000}, "tool_R2"),
+                      k_call_id("Grep", {"pattern": "x", "path": saved}, "tool_R3")], sess)
+    check(G14, "读这次 kimi 替工人存的大输出（Read 分页、Grep 搜）：不算越界，完成，回答照常打印",
+          r.rc == 0 and r.status == "完成" and "越界记录" not in r.out and "假工人的回答" in r.out, brief(r))
+    other = os.path.join(sess, "wd_别的_0123456789ab", "session_bbbb", "agents", "main", "tool-results",
+                         "Read-tool_Other-%s.txt" % UUID_TAIL)
+    r = kimi_sess(T, [big, k_call_id("Read", {"path": other}, "tool_R1")], sess)
+    check(G14, "别的会话的存档（调用 id 这次没出现过）：照旧 ‼ 严重越界",
+          r.rc == 3 and r.status == "越界" and r.out.count("‼ 严重越界") == 1, brief(r))
+    wrong_tool = os.path.join(here, "tool-results", "Read-tool_Big1-%s.txt" % UUID_TAIL)
+    wrong_dir = os.path.join(here, "别的目录", "Grep-tool_Big1-%s.txt" % UUID_TAIL)
+    cred = os.path.join(WS, "工人家.nosync", "kimi", "credentials", "kimi-code.json")
+    r = kimi_sess(T, [big, k_call_id("Read", {"path": wrong_tool}, "tool_R1"),
+                      k_call_id("Read", {"path": wrong_dir}, "tool_R2"),
+                      k_call_id("Read", {"path": cred}, "tool_R3"),
+                      k_call_id("Glob", {"pattern": os.path.join(here, "tool-results") + "/*.txt"}, "tool_R4")], sess)
+    check(G14, "工具名对不上、不在 tool-results 里、工人家里的凭据、通配整个存档目录：4 条都 ‼",
+          r.rc == 3 and r.out.count("‼ 严重越界") == 4, brief(r))
+    r = run(T, ["flash", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务"],
+            {"events": [d_call("grep", {"pattern": "测试"}), d_call("read", {"file_path": saved}), d_step()],
+             "after": [d_final()]}, sessions=sess)
+    check(G14, "flash 读 kimi 的存档（原始记录里没有 kimi 的调用 id）：照旧 ‼",
+          r.rc == 3 and r.out.count("‼ 严重越界") == 1, brief(r))
+
+
+@test(G14)
+def n_tmp(T, M):
+    out = tempfile.mkdtemp(prefix="结果夹-", dir=WORK)
+    tag = uuid.uuid4().hex[:8]
+    draft = "/tmp/waibao-测试-%s/原型.tail.js" % tag                              # 假工人不真写，只吐事件
+    var_t = "/var/folders/zz/waibao测试%s/T/kimi-code-failrun-1/草稿.js" % tag      # 经 /var 软链接
+    try:
+        r = kimi_sess(T, [k_call_id("Write", {"path": os.path.join(out, "原型.html"), "content": "x"}, "tool_W1"),
+                          k_call_id("Write", {"path": draft, "content": "y"}, "tool_W2"),
+                          k_call_id("Write", {"path": var_t, "content": "z"}, "tool_W3"),
+                          k_call_id("Read", {"path": draft}, "tool_R1")], None, out=out)
+        check(G14, "--out 工人往系统临时目录写草稿（/tmp、/var/folders/…/T/）再读回来：不停掉、完成、回答照常打印",
+              r.rc == 0 and r.status == "完成" and not marked(r) and "假工人的回答" in r.out, brief(r))
+        check(G14, "临时目录的两次写入各记一条「写到临时目录」，读回来不再记；结果文件夹里那次照常列在写入里",
+              r.out.count(" 写到临时目录 ") == 2 and "越界记录 2 条" in r.out and "写了 1 个文件" in r.out, brief(r))
+        r = kimi_sess(T, [k_call_id("Write", {"path": draft, "content": "y"}, "tool_W1"),
+                          k_call_id("Read", {"path": "/tmp/waibao-测试-%s/别的.txt" % tag}, "tool_R1")], None, out=out)
+        check(G14, "读临时目录里自己没写过的文件：照旧 ‼ 严重越界",
+              r.rc == 3 and r.status == "越界" and r.out.count("‼ 严重越界") == 1, brief(r))
+        for bad, what in (("/private/var/folders/zz/waibao测试%s/C/缓存" % tag, "缓存目录（…/C/）"),
+                          ("/tmp/../etc/waibao测试%s" % tag, "用 .. 绕出 /tmp"),
+                          ("/var/folders/zz/waibao测试%s/T/../../X/y" % tag, "用 .. 绕出 …/T/")):
+            r = kimi_sess(T, [k_call_id("Write", {"path": bad, "content": "x"}, "tool_W1")], None, out=out, hang=30)
+            check(G14, "写到%s：照旧当场停掉，‼ 写到结果文件夹以外" % what,
+                  r.secs < 15 and r.rc == 3 and r.status == "越界" and "写到结果文件夹以外" in r.out and marked(r),
+                  brief(r))
+        r = kimi_sess(T, [k_call_id("Write", {"path": draft, "content": "y"}, "tool_W1")], None, hang=30)
+        check(G14, "不加 --out 的工人往临时目录写：照旧是不该有的工具，当场停掉",
+              r.secs < 15 and r.status == "越界" and "不该有的工具 Write" in r.out, brief(r))
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
 
 def main():
     global TMP
