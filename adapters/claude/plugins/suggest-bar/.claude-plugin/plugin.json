@@ -1,0 +1,9 @@
+{
+  "name": "suggest-bar",
+  "version": "0.3.1",
+  "description": "每轮回复后用 Opus 猜你的下一句：收起时上下文那一行前面一个「建议」按钮，展开显示建议、点「填入」或「直接发送」；/suggest off|on 完全关闭或打开",
+  "author": {
+    "name": "Qlimen"
+  },
+  "types": "./types/index.d.ts"
+}

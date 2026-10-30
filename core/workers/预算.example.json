@@ -1,7 +1,7 @@
 {
   "说明": "Qlimen 派工的预算、价目、目录范围与外壳路径。install.sh 会把 {{…}} 换成你的路径，生成同目录的 预算.json。预算和调度只记录和提醒，不拦：日上限（deepseek_daily_cny、kimi_daily_calls）和超长上限（timeout_sec：不给 --timeout 时到点收工，给得更长只提醒）超了只在派工前和回执里提醒，用户批准高于预算。价格是 DeepSeek 官网高峰价（元/百万 tokens），估算偏高不偏低；Kimi 走会员额度，按次数记。数字按你自己的订阅改，改之前想清楚。",
   "deepseek_daily_cny": 30,
-  "kimi_daily_calls": {"k3": 100, "k28": 200},
+  "kimi_daily_calls": {"k31": 100, "k3": 100, "k28": 200},
   "apply_max_ops": 200,
   "timeout_sec": 600,
   "prices_cny_per_mtok": {

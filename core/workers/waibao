@@ -3,15 +3,15 @@
 """waibao：把任务派给 dsh / kimi 的无头工人（Qlimen core/workers）。
 
   waibao flash --dir <目录> --tag <标签> --plan "<一句话：操作、成本、规划>" --task "<任务>"
-  waibao k3|k28 --dir <目录> --tag <标签> --plan "..." --task-file 任务.txt
-  waibao k3|k28 --web --tag <标签> --plan "..." --task "<任务>"   联网工人：只能搜索和读网页，读不了本地文件
-  waibao k3|k28 --dir <目录> --out <目录里的结果文件夹> --timeout 秒 ...   能写文件的工人：只能写进结果文件夹
+  waibao k31|k3|k28 --dir <目录> --tag <标签> --plan "..." --task-file 任务.txt
+  waibao k31|k3|k28 --web --tag <标签> --plan "..." --task "<任务>"   联网工人：只能搜索和读网页，读不了本地文件
+  waibao k31|k3|k28 --dir <目录> --out <目录里的结果文件夹> --timeout 秒 ...   能写文件的工人：只能写进结果文件夹
   echo "<任务>" | waibao flash --dir <目录> --tag <标签> --plan "..."
   waibao --status
   waibao apply --dir <根目录> --list 清单.json [--dry-run]   照工人出的操作清单执行（只有 mkdir/move/rename）
   waibao undo <撤销记录.json>                               按撤销记录反向恢复（先按 apply 的规矩整份预审）
 
-模型：flash 走 dsh（沙箱只读，补丁关掉命令行和联网）；k3 / k28 走 kimi（工具白名单：默认本地只读，--web 换成只联网，
+模型：flash 走 dsh（沙箱只读，补丁关掉命令行和联网）；k31 / k3 / k28 走 kimi（工具白名单：默认本地只读，--web 换成只联网，
 --out 换成读本地 + 只写结果文件夹，写入另由系统沙箱限定在那个文件夹）。
 读本地文件的工人不给联网，联网的工人不给读本地文件；工人用了名单以外的工具当场中止，读过的工作目录以外的路径列在回执里。
 两种误报不再判严重（2026-10-20）：kimi 把大输出存进会话目录的 tool-results 后工人读回来，不算越界；--out 工人往
@@ -60,6 +60,7 @@ WORKER_ENV = {k: _p(_HOMES[n]) for k, n in (("DSH_HOME", "dsh"), ("KIMI_CODE_HOM
 
 MODELS = {
     "flash": {"shell": "dsh"},
+    "k31": {"shell": "kimi", "alias": "kimi-code/k3.1-pro"},   # 2026-10-25 加：K3.1 Pro（会员）
     "k3": {"shell": "kimi", "alias": "kimi-code/k3"},
     "k28": {"shell": "kimi", "alias": "kimi-code/kimi-for-coding"},
 }
@@ -1032,11 +1033,11 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("apply", "undo"):
         return (cmd_apply if sys.argv[1] == "apply" else cmd_undo)(sys.argv[2:])
     ap = argparse.ArgumentParser(prog="waibao", description="把任务派给 dsh / kimi 的无头工人")
-    ap.add_argument("model", nargs="?", choices=sorted(MODELS), help="flash 走 dsh；k3 / k28 走 kimi")
+    ap.add_argument("model", nargs="?", choices=sorted(MODELS), help="flash 走 dsh；k31 / k3 / k28 走 kimi")
     ap.add_argument("--dir", help="工人的工作目录，只能在允许外发的范围内；加了 --web 可以不给")
     ap.add_argument("--web", action="store_true",
-                    help="联网工人：只有搜索和读网页，读不了本地文件（只对 k3 / k28）；不加就是本地只读，没有联网工具")
-    ap.add_argument("--out", help="能写文件的工人（只对 k3 / k28）：只能往这个文件夹里写，它必须在 --dir 里面，没有会新建")
+                    help="联网工人：只有搜索和读网页，读不了本地文件（只对 k31 / k3 / k28）；不加就是本地只读，没有联网工具")
+    ap.add_argument("--out", help="能写文件的工人（只对 k31 / k3 / k28）：只能往这个文件夹里写，它必须在 --dir 里面，没有会新建")
     ap.add_argument("--tag", help="短标签，用在结果文件名和账本里")
     ap.add_argument("--plan", help="一句话：预估操作、成本、规划（记入账本）；超上限的写明用户批准")
     ap.add_argument("--task", help="任务文本；不给则读 --task-file 或标准输入")
@@ -1052,12 +1053,12 @@ def main():
         show_status(cfg)
         return 0
     if not a.model:
-        raise Refused("缺少模型：flash / k3 / k28。")
+        raise Refused("缺少模型：flash / k31 / k3 / k28。")
     shell = MODELS[a.model]["shell"]
     if a.web and shell != "kimi":
-        raise Refused("%s 不接受 --web：联网查资料派 k28 或 k3。" % a.model)
+        raise Refused("%s 不接受 --web：联网查资料派 k31、k3 或 k28。" % a.model)
     if a.out and shell != "kimi":
-        raise Refused("%s 不接受 --out：要写文件派 k3 或 k28。" % a.model)
+        raise Refused("%s 不接受 --out：要写文件派 k31、k3 或 k28。" % a.model)
     if a.out and a.web:
         raise Refused("--out 和 --web 不能一起用：写文件的工人不联网。")
     if a.timeout is not None and a.timeout <= 0:
@@ -1099,7 +1100,7 @@ def main():
     text = rules + "\n" + task.strip() + "\n"
     hint = ""
     if not a.web and WEB_HINT.search(task):
-        hint = "提醒：任务书里像是要联网，但这次派的是本地工人，没有联网工具；要联网请派 k28 / k3 并加 --web。"
+        hint = "提醒：任务书里像是要联网，但这次派的是本地工人，没有联网工具；要联网请派 k31 / k3 / k28 并加 --web。"
 
     limit = int(cfg["timeout_sec"])
     timeout = a.timeout or limit

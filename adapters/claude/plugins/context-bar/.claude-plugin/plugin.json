@@ -1,0 +1,9 @@
+{
+  "name": "context-bar",
+  "version": "0.1.0",
+  "description": "输入框上方显示上下文用量，快满时提醒交接；压缩摘要用简体中文写",
+  "author": {
+    "name": "Qlimen"
+  },
+  "types": "./types/index.d.ts"
+}
