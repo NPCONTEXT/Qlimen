@@ -7,6 +7,8 @@ waibao 用环境变量 WAIBAO_DSH / WAIBAO_KIMI 把它当成壳来启动。
 events 里的字典按一行 JSON 吐出，字符串原样吐出（用来造畸形行）。
 hang 是吐完以后赖着不退出的秒数；没被杀掉的话再吐 after。
 touch（2026-10-09 加，测系统沙箱）：吐事件之前，挨个往这些路径写一个文件，结果（写成 / 被挡）记进 FAKE_LOG + ".touch.json"。
+wire（2026-11-03 加，测按派工编号补记用量）：当 kimi 时，吐事件之前像 kimi 那样在 WAIBAO_KIMI_SESSIONS 下写一份会话记录，
+开头是任务文字，后面每个字典是一条 usage.record。
 """
 import json
 import os
@@ -43,6 +45,16 @@ if spec.get("touch") and log:
             got[p] = "被挡：%s" % e.strerror
     with open(log + ".touch.json", "w", encoding="utf-8") as f:
         json.dump(got, f, ensure_ascii=False)
+
+
+if spec.get("wire") is not None and not as_dsh:
+    import uuid
+    d = os.path.join(os.environ["WAIBAO_KIMI_SESSIONS"], "wd_假", "session_" + uuid.uuid4().hex, "agents", "main")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "wire.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "turn.prompt", "input": [{"type": "text", "text": text}]}, ensure_ascii=False) + "\n")
+        for g in spec["wire"]:
+            f.write(json.dumps({"type": "usage.record", "usage": g}) + "\n")
 
 
 def emit(evs):

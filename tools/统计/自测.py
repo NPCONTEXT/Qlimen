@@ -246,6 +246,10 @@ def main():
         check('不带时区后缀的按本机本地时间', T.parse_cfg_time('2000-01-01T08:00:00', 'x') == datetime.datetime(2000, 1, 1, 8, 0).timestamp())
         rc5, out5, err5 = run(['--claude', claude, '--no-dsh', '--no-codex'])
         check('不给 --stages 也能跑，整个算「全部」', rc5 == 0 and row(section(out5, '1. 按回合'), 'Claude · 全部') is not None, err5[-300:])
+
+        print('4. 新旧写法都认（2026-11-04 起状态词是【施工】【等你】【收工】、三件套第三份是 记录.md）')
+        check('新状态词、旧状态词都算首条带标记', all(x.startswith(T.MARKS) for x in ('【施工】好', '【等你】交了', '【收工】完', '【进行中】好', '【已完成】完')) and not '好的'.startswith(T.MARKS))
+        check('记录.md、交接.md 都算三件套', bool(T.RE_TRIO_NAME.search('echo x >> 任务/记录.md')) and bool(T.RE_TRIO_NAME.search('任务/交接.md')) and not T.RE_TRIO_NAME.search('任务/说明.md'))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     n = len(RESULTS); ok = sum(RESULTS)

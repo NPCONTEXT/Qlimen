@@ -17,7 +17,10 @@
 两种误报不再判严重（2026-10-20）：kimi 把大输出存进会话目录的 tool-results 后工人读回来，不算越界；--out 工人往
 系统临时目录写草稿，不中止，只记一条普通越界，读回来不再记。
 预算只记账和提醒，不拦（2026-10-09 用户定）：日上限、超长上限（不给 --timeout 时的时限）超了只在派工前和回执里提醒。
-预算、价目、目录范围、外壳与账本路径都在同目录 预算.json。退出码：0 完成，2 被拒绝，3 失败/超时/越界。
+账本（2026-11-03 加）：「派工方」列顺着父进程认出是谁派的（Claude / DSH / Codex / Kimi / 终端，认不出记「未知」）；
+工人没正常结束（中断、超时、越界、调度脚本被停掉）时 kimi 不吐会话编号，改按任务里的派工编号找回会话记录补记用量；
+调度脚本收到 SIGTERM / SIGHUP 先杀工人、记账再退出，被硬杀（SIGKILL）的那条下次 sweep 时补。
+预算、价目、目录范围、外壳与账本路径都在同目录 预算.json。退出码：0 完成，2 被拒绝，3 失败/超时/越界，被信号停掉 128+信号号。
 只依赖系统自带的 Python 3.9 标准库。
 """
 import argparse
@@ -84,7 +87,15 @@ SANDBOX = "/usr/bin/sandbox-exec"
 WEB_DIR = os.path.join(os.path.dirname(BASE), "联网工作目录.nosync")
 WEB_HINT = re.compile(r"联网|搜索|网上|官网|https?://")
 FIELDS =["id", "日期", "开始时间", "模型", "壳", "标签", "目录", "状态", "耗时秒",
-          "输入未缓存", "输入缓存", "输出", "估算花费元", "pid", "说明", "结果文件"]
+          "输入未缓存", "输入缓存", "输出", "估算花费元", "pid", "说明", "结果文件", "派工方"]   # 派工方：2026-11-03 加在最后，旧行是空的
+# 任务开头带上派工编号（= 账本 id），工人没正常结束、kimi 没吐会话编号时靠它找回会话记录（2026-11-03 加）
+MARK = "（派工编号 waibao-%s：调度方对账用，不用理会）"
+# 派工方：顺着父进程往上，第一个认得的程序（看可执行文件路径，不看命令行参数，任务文字里写了什么不影响）
+DISPATCHERS = (("Claude", re.compile(r"/claude(\.app)?(/|$)", re.I)),
+               ("DSH", re.compile(r"DeepSeek Harness|/dsh$", re.I)),
+               ("Codex", re.compile(r"codex", re.I)),
+               ("Kimi", re.compile(r"/kimi$|kimi-code", re.I)),
+               ("终端", re.compile(r"Terminal\.app|iTerm|Warp\.app|Ghostty", re.I)))
 RECEIPT_LINES = 40
 
 
@@ -141,10 +152,43 @@ def pid_alive(pid):
 
 
 def sweep(rows):
-    """调度进程已不在却还标着运行中的行，改成中断；预留的花费保留，宁可多算。"""
+    """调度进程已不在却还标着运行中的行，改成中断；预留的花费保留，宁可多算。
+    kimi 的行按派工编号找回会话记录补记用量（2026-11-03 加：调度脚本被硬杀时自己来不及记）。"""
     for r in rows:
         if r["状态"] == "运行中" and not pid_alive(r["pid"]):
             r["状态"] = "中断"
+            if r.get("壳") == "kimi" and not any(r.get(k) for k in ("输入未缓存", "输入缓存", "输出")):
+                try:
+                    since = time.mktime(time.strptime(r["日期"] + " " + r["开始时间"], "%Y-%m-%d %H:%M:%S"))
+                except (ValueError, OverflowError):
+                    continue
+                w = find_kimi_session(r["id"], since)
+                if w:
+                    u = wire_usage(w)
+                    r.update({"输入未缓存": str(u["in"]), "输入缓存": str(u["cache"]), "输出": str(u["out"])})
+
+
+def dispatcher():
+    """派工方：顺着父进程往上找认得的程序（2026-11-03 加），认不出记「未知」。只用一次 ps。"""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,comm="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, encoding="utf-8", errors="replace", timeout=5).stdout
+    except Exception:
+        return "未知"
+    tab = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            tab[int(parts[0])] = (int(parts[1]), parts[2])
+    pid, seen = os.getppid(), set()
+    while pid in tab and pid not in seen and pid > 1:
+        seen.add(pid)
+        ppid, comm = tab[pid]
+        for name, pat in DISPATCHERS:
+            if pat.search(comm):
+                return name
+        pid = ppid
+    return "未知"
 
 
 def today_totals(rows, today):
@@ -351,6 +395,7 @@ def run_dsh(model, cfg, cwd, text, rawpath, timeout, prof):
     cmd = [DSH, "headless", "--patch", DSH_PATCH, "--json", "-"]
     env = dict(os.environ, DSH_PERMISSION_MODE="read-only", **WORKER_ENV)
     u = {"in": 0, "cache": 0, "out": 0}
+    _LIVE["u"] = u                            # 同一个字典，边跑边加；被打断时 main 从这里拿
     final, err, flag = None, None, {}
     with open(rawpath, "w", encoding="utf-8") as raw, open(rawpath + ".err", "w") as errf:
         p = _spawn(cmd, cwd, env, errf, subprocess.PIPE)
@@ -402,18 +447,70 @@ def kimi_usage(sid):
     if not sid:
         return u
     for w in glob.glob(os.path.join(KIMI_SESSIONS, "*", sid, "agents", "main", "wire.jsonl")):
-        with open(w, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        wire_usage(w, u)
+    return u
+
+
+def wire_usage(w, u=None):
+    """一份 kimi 会话记录（wire.jsonl）里的用量，加到 u 上"""
+    u = u if u is not None else {"in": 0, "cache": 0, "out": 0}
+    with open(w, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") == "usage.record" and isinstance(ev.get("usage"), dict):
+                g = ev["usage"]
                 try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get("type") == "usage.record" and isinstance(ev.get("usage"), dict):
-                    g = ev["usage"]
                     u["in"] += int(g.get("inputOther") or 0) + int(g.get("inputCacheCreation") or 0)
                     u["cache"] += int(g.get("inputCacheRead") or 0)
                     u["out"] += int(g.get("output") or 0)
+                except (TypeError, ValueError):
+                    continue
     return u
+
+
+def find_kimi_session(rid, since):
+    """按任务开头的派工编号找回这次的 kimi 会话记录（2026-11-03 加）。工人没正常结束时 kimi 不吐会话编号，
+    原来这种就记 0（11-02 三条中断、10-16 起十来条失败 / 超时）。只看 since 之后改过的会话，每个读开头 256 KB。"""
+    if not rid:
+        return None
+    key = ("waibao-" + rid).encode("utf-8")
+    for w in glob.glob(os.path.join(KIMI_SESSIONS, "*", "session_*", "agents", "main", "wire.jsonl")):
+        try:
+            if os.path.getmtime(w) < since - 5:
+                continue
+            with open(w, "rb") as f:
+                if key in f.read(256 << 10):
+                    return w
+        except OSError:
+            continue
+    return None
+
+
+def recover_usage(shell, rid, t0):
+    """工人没正常结束、手里的用量是 0 时补（2026-11-03 加）：kimi 按派工编号找回会话记录；dsh 用跑的时候已经记到的。"""
+    if shell == "kimi":
+        w = find_kimi_session(rid, t0)
+        return wire_usage(w) if w else None
+    live = _LIVE.get("u")
+    return dict(live) if live and any(live.values()) else None
+
+
+# 跑的过程中已经记到的用量（dsh 边跑边加；调度脚本被打断时从这里拿）
+_LIVE = {}
+# 收到哪个信号（SIGTERM / SIGHUP）被停掉
+_STOP = {}
+
+
+class Stopped(BaseException):
+    """收到 SIGTERM / SIGHUP：当成被打断，走和 Ctrl-C 一样的路——杀掉工人、记账、退出（2026-11-03 加）"""
+
+
+def _on_signal(signum, frame):
+    _STOP.setdefault("sig", signal.Signals(signum).name)
+    raise Stopped(signum)
 
 
 def run_kimi(model, cfg, cwd, text, rawpath, timeout, prof):
@@ -1025,8 +1122,9 @@ def show_status(cfg):
         print("  " + today_line(m, cfg, spent, calls))
     print("  超长上限：不给 --timeout 时 %d 秒收工；给了可以更长，回执提醒" % int(cfg["timeout_sec"]))
     for r in rows[-8:]:
-        print("  %s %s %-5s %s %ss ¥%s  %s" % (r["日期"], r["开始时间"], r["模型"], r["状态"],
-                                               r["耗时秒"] or "-", r["估算花费元"] or "0", r["标签"]))
+        print("  %s %s %-5s %s %ss ¥%s  %s%s" % (r["日期"], r["开始时间"], r["模型"], r["状态"],
+                                                 r["耗时秒"] or "-", r["估算花费元"] or "0", r["标签"],
+                                                 "（%s 派）" % r["派工方"] if r.get("派工方") else ""))
 
 
 def main():
@@ -1097,6 +1195,9 @@ def main():
         rules = f.read().rstrip()
     if prof.get("out"):
         rules = rules.replace("{结果文件夹}", prof["out"])
+    rid = uuid.uuid4().hex[:12]
+    head = "【任务】"                           # 守则最后一行是「【任务】」：派工编号放在它前面，任务那段只有任务
+    rules = (rules[:-len(head)].rstrip() + "\n\n" + MARK % rid + "\n\n" + head) if rules.endswith(head) else rules + "\n" + MARK % rid
     text = rules + "\n" + task.strip() + "\n"
     hint = ""
     if not a.web and WEB_HINT.search(task):
@@ -1137,20 +1238,31 @@ def main():
     ts = now.strftime("%Y%m%d-%H%M%S")
     rawpath, outpath = _claim(lambda h: (os.path.join(OUT, "原始", "%s-%s-%s-%s.jsonl" % (ts, h, a.model, tag)),
                                          os.path.join(OUT, "%s-%s-%s-%s.md" % (ts, h, a.model, tag))))
-    rid = uuid.uuid4().hex[:12]
     plan = a.plan + ("（结果文件夹：%s）" % prof["out"] if prof.get("out") else "")
     warn = reserve(a.model, cfg, {"id": rid, "日期": now.date().isoformat(), "开始时间": now.strftime("%H:%M:%S"),
-                                  "模型": a.model, "壳": shell, "标签": tag, "目录": cwd, "说明": plan})
+                                  "模型": a.model, "壳": shell, "标签": tag, "目录": cwd, "说明": plan,
+                                  "派工方": dispatcher()})
     for x in (warn, long_note):
         if x:
             print("[waibao] " + x, flush=True)
     t0 = time.time()
     res = {"status": "中断", "err": "调度脚本异常退出", "final": "", "u": {"in": 0, "cache": 0, "out": 0}}
     audit, serious, audit_failed = [], False, False
+    _LIVE.clear()
+    for sig in (signal.SIGTERM, signal.SIGHUP):   # 调度方停掉后台任务时多半发 SIGTERM：原来 Python 直接退出，账本停在「运行中」、工人没人杀
+        signal.signal(sig, _on_signal)
     try:
         runner = run_dsh if shell == "dsh" else run_kimi
         res = runner(a.model, cfg, cwd, text, rawpath, timeout, prof)
     finally:
+        for sig in (signal.SIGTERM, signal.SIGHUP):   # 收尾记账时别再被打断
+            signal.signal(sig, signal.SIG_IGN)
+        if _STOP and res["status"] == "中断":
+            res["err"] = "收到 %s：调度方停掉了这次派工" % _STOP["sig"]
+        if not any(res["u"].values()):
+            got = recover_usage(shell, rid, t0)
+            if got:
+                res["u"] = got
         secs = int(round(time.time() - t0))
         try:
             audit, serious = read_audit(rawpath, cwd, cfg, prof["tools"], prof.get("out"))
@@ -1164,6 +1276,8 @@ def main():
         spent, calls = settle(rid, {"状态": res["status"], "耗时秒": str(secs), "输入未缓存": str(u["in"]),
                                     "输入缓存": str(u["cache"]), "输出": str(u["out"]),
                                     "估算花费元": "%.4f" % money, "结果文件": outpath})
+        for sig in (signal.SIGTERM, signal.SIGHUP):   # 账记完了，恢复默认（后面写回执时再收到就直接退出）
+            signal.signal(sig, signal.SIG_DFL)
 
     body = res["final"].strip()
     web, wrote = [], []
@@ -1234,3 +1348,6 @@ if __name__ == "__main__":
     except Refused as e:
         print("[waibao] 拒绝：%s" % e, file=sys.stderr)
         sys.exit(2)
+    except Stopped as e:
+        print("[waibao] 被停掉了（%s）：工人已杀，账本记成「中断」，用量照实记" % _STOP.get("sig", ""), file=sys.stderr)
+        sys.exit(128 + int(e.args[0]) if e.args else 143)

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -91,7 +92,8 @@ class Run(object):
     pass
 
 
-def run(target, args, scen=None, rows=None, fields=None, driver=None, wait=90, sessions=None):
+def run(target, args, scen=None, rows=None, fields=None, driver=None, wait=90, sessions=None, pre=None, stop=None):
+    """pre(d)：起 waibao 之前先在临时目录里摆东西；stop=(信号, ready)：等 ready(d) 为真后给 waibao 发这个信号（2026-11-03 加）"""
     d = tempfile.mkdtemp(dir=TMP)
     ledger = os.path.join(d, "账本.csv")
     env = dict(os.environ, WAIBAO_DSH=FAKE, WAIBAO_KIMI=FAKE, WAIBAO_LEDGER=ledger,
@@ -104,10 +106,23 @@ def run(target, args, scen=None, rows=None, fields=None, driver=None, wait=90, s
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             w.writerows(rows)
+    if pre:
+        pre(d)
     cmd = ([PY, "-c", driver, target] if driver else [PY, target]) + args
     t0 = time.time()
-    p = subprocess.run(cmd, env=env, input="", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       universal_newlines=True, encoding="utf-8", errors="replace", timeout=wait)
+    if stop:
+        sig, ready = stop
+        q = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True, encoding="utf-8", errors="replace")
+        while time.time() - t0 < 20 and not (os.path.exists(env["FAKE_LOG"]) and ready(d)):
+            time.sleep(0.1)
+        time.sleep(0.5)                       # 让 waibao 把已经吐出来的事件读完
+        q.send_signal(sig)
+        out, err = q.communicate(timeout=wait)
+        p = subprocess.CompletedProcess(cmd, q.returncode, out, err)
+    else:
+        p = subprocess.run(cmd, env=env, input="", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, encoding="utf-8", errors="replace", timeout=wait)
     r = Run()
     r.rc, r.out, r.err, r.secs, r.dir = p.returncode, p.stdout, p.stderr, time.time() - t0, d
     r.log = None
@@ -1159,6 +1174,102 @@ def m_same_second(T, M):
               brief(r) + " ｜" + str([os.path.basename(p) for p in recs]))
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------- 账本补记和派工方（2026-11-03 加） ----------
+
+G15 = "账本补记和派工方（2026-11-03）"
+# 两条用量合计：入 100+10+1 = 111，缓存 1000+2 = 1002，出 50+3 = 53
+WIRE = [{"inputOther": 100, "inputCacheCreation": 10, "inputCacheRead": 1000, "output": 50},
+        {"inputOther": 1, "inputCacheRead": 2, "output": 3}]
+WANT = ("111", "1002", "53")
+
+
+def used(r):
+    x = r.rows[-1] if r.rows else {}
+    return (x.get("输入未缓存"), x.get("输入缓存"), x.get("输出"))
+
+
+def put_wire(d, text, usage):
+    """在临时会话目录里摆一份 kimi 会话记录（和假工人写的一样）"""
+    w = os.path.join(d, "会话", "wd_摆的", "session_" + uuid.uuid4().hex, "agents", "main")
+    os.makedirs(w, exist_ok=True)
+    with open(os.path.join(w, "wire.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "turn.prompt", "input": [{"type": "text", "text": text}]}, ensure_ascii=False) + "\n")
+        for g in usage:
+            f.write(json.dumps({"type": "usage.record", "usage": g}) + "\n")
+
+
+def wire_ready(d):
+    return bool(glob.glob(os.path.join(d, "会话", "wd_假", "session_*", "agents", "main", "wire.jsonl")))
+
+
+@test(G15)
+def l_dispatcher(T, M):
+    r = run(T, ["k28", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务"], {"events": [k_final(), K_META]})
+    x = r.rows[-1] if r.rows else {}
+    want = "Claude" if os.environ.get("CLAUDECODE") else None
+    check(G15, "账本最后一列是「派工方」；在 Claude Code 里跑记「Claude」（别处跑只查不空）",
+          r.rc == 0 and M.FIELDS[-1] == "派工方" and x.get("派工方") and (want is None or x.get("派工方") == want),
+          "派工方=%r；%s" % (x.get("派工方"), brief(r)))
+    check(G15, "任务开头带派工编号（= 账本 id）", bool(r.log) and ("派工编号 waibao-%s" % x.get("id")) in r.log["text"], brief(r))
+    oldf = [f for f in M.FIELDS if f != "派工方"]
+    old = row(M, "k28", "kimi")
+    old.pop("派工方", None)
+    r = run(T, ["k28", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务"], {"events": [k_final(), K_META]},
+            rows=[old], fields=oldf)
+    check(G15, "旧账本（没有派工方列）照常追加：旧行原样留着、派工方空着，新行有派工方",
+          r.rc == 0 and len(r.rows) == 2 and r.rows[0]["id"] == old["id"] and r.rows[0].get("派工方") == ""
+          and r.rows[1].get("派工方"), brief(r))
+    r = run(T, ["--status"], rows=[dict(row(M, "k31", "kimi"), 派工方="DSH", 标签="看派工方")], fields=M.FIELDS)
+    check(G15, "--status 的每行带上是谁派的", r.rc == 0 and "看派工方（DSH 派）" in r.out, brief(r))
+
+
+@test(G15)
+def l_stop(T, M):
+    scen = {"wire": WIRE, "events": [k_call(("Read", {"path": "a.txt"}))], "hang": 30, "after": [k_final(), K_META]}
+    args = ["k28", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务"]
+    for sig, rc in ((signal.SIGTERM, 143), (signal.SIGHUP, 129)):
+        r = run(T, args, scen, stop=(sig, wire_ready))
+        x = r.rows[-1] if r.rows else {}
+        check(G15, "kimi 工人跑着时 waibao 收到 %s：工人被杀，账本「中断」、耗时有数，用量按派工编号补上，退出码 %d、没有 Traceback"
+              % (sig.name, rc),
+              r.rc == rc and x.get("状态") == "中断" and used(r) == WANT and x.get("耗时秒") not in ("", None)
+              and bool(r.log) and dead(r.log["pid"]) and "Traceback" not in r.err and "被停掉了" in r.err,
+              "用量=%r；%s" % (used(r), brief(r)))
+    r = run(T, ["flash", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务"],
+            {"events": [d_step(100, 50)], "hang": 30, "after": [d_step(), d_final()]}, stop=(signal.SIGTERM, lambda d: True))
+    x = r.rows[-1] if r.rows else {}
+    check(G15, "flash 跑着时收到 SIGTERM：账本「中断」，已经记到的用量照记、花费不是 0",
+          r.rc == 143 and x.get("状态") == "中断" and x.get("输出") == "50" and float(x.get("估算花费元") or 0) > 0
+          and bool(r.log) and dead(r.log["pid"]), "用量=%r；%s" % (used(r), brief(r)))
+
+
+@test(G15)
+def l_recover(T, M):
+    scen = {"wire": WIRE, "events": [k_call(("Read", {"path": "a.txt"}))], "hang": 30, "after": [k_final(), K_META]}
+    args = ["k28", "--dir", WORK] + BASE_ARGS + ["--task", "测试任务", "--timeout", "2"]
+    r = run(T, args, scen)
+    check(G15, "kimi 超时（kimi 没吐会话编号）：状态「超时」，用量按派工编号补上（原来记 0）",
+          r.status == "超时" and used(r) == WANT, "用量=%r；%s" % (used(r), brief(r)))
+    decoy = lambda d: put_wire(d, "别的任务（派工编号 waibao-000000000000：调度方对账用，不用理会）", WIRE)
+    r = run(T, args, dict(scen, wire=None), pre=decoy)
+    check(G15, "只认自己的派工编号：工人没留会话记录时，别的会话的用量不算到这条头上",
+          r.status == "超时" and used(r) == ("0", "0", "0"), "用量=%r；%s" % (used(r), brief(r)))
+    when = datetime.datetime.now() - datetime.timedelta(minutes=2)
+    rid = "abcdef123456"
+    stuck = row(M, "k31", "kimi")
+    stuck.update({"id": rid, "日期": when.date().isoformat(), "开始时间": when.strftime("%H:%M:%S"), "状态": "运行中",
+                  "pid": "999999", "输入未缓存": "", "输入缓存": "", "输出": ""})
+    pre = lambda d: put_wire(d, "任务（派工编号 waibao-%s：调度方对账用，不用理会）" % rid, WIRE)
+    r = run(T, ["--status"], rows=[stuck], fields=M.FIELDS, pre=pre)
+    x = r.rows[-1] if r.rows else {}
+    check(G15, "调度脚本被硬杀留下的「运行中」：下次 --status 改成「中断」，用量按派工编号补上",
+          r.rc == 0 and x.get("状态") == "中断" and used(r) == WANT, "行=%r；%s" % (x, brief(r)))
+    stuck2 = dict(stuck, id="fedcba654321")
+    r = run(T, ["--status"], rows=[stuck2], fields=M.FIELDS, pre=pre)
+    check(G15, "找不到自己的会话记录：照旧只改成「中断」，用量空着", r.rc == 0 and r.rows[-1]["状态"] == "中断"
+          and used(r) == ("", "", ""), "行=%r；%s" % (r.rows[-1] if r.rows else None, brief(r)))
 
 
 # ---------- 入口 ----------

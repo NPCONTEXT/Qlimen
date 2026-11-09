@@ -8,8 +8,9 @@ TODO.md、交接.md、方案.md、索引.md、接手索引.md 的路径（相对
 被改到的文件有问题，就输出 additionalContext 提醒模型（同一个文件 30 分钟内只提醒一次）；没问题不输出。
 命令行模式：doccheck 文件或目录……，列出问题；退出码 0 = 没问题，1 = 有问题。
 
-查什么（规则见核心协议 §6）：
-- 字数（按字符）：TODO.md 8000、交接.md 1 万、方案.md 1.2 万；索引 3000。
+查什么（规则见核心协议 §6；2026-11-04 放宽：TODO、交接不查总字数）：
+- 字数（按字符）：方案.md 约 1.2 万（超了提醒拆成两批）；索引 3000；TODO 最上面「## 现在」约 1000（超了多半是在往里追加历史）。
+- 还有 交接.md 的（旧写法）：提醒方便时照核心 §6 迁，不催字数。
 - 表格：表格中间夹了非表格行（一格里塞了换行，表格从这里断开）；某行的格数和表头不同；
   TODO.md 里表格一行不超过 300 字，表头第一格是「编号」的表里编号不能重复。
 - 索引：反引号里带「/」或以 .md 结尾的路径要存在（先按索引所在目录算，再按上一级算）；
@@ -23,14 +24,15 @@ import re
 import sys
 import time
 
-LIMITS = {"TODO.md": 8000, "交接.md": 10000, "方案.md": 12000}
+LIMITS = {"方案.md": 12000}
+NOW_LIMIT = 1000
 INDEX_NAMES = ("索引.md", "接手索引.md")
 INDEX_LIMIT = 3000
 ROW_LIMIT = 300
 QUIET_SECONDS = 30 * 60
 FRESH_SECONDS = 60
 HOME = os.path.expanduser("~")
-NAMES = tuple(LIMITS) + INDEX_NAMES
+NAMES = ("TODO.md", "交接.md", "方案.md") + INDEX_NAMES
 EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
 SHELL_TOOLS = ("Bash", "bash")
 STATE = os.environ.get("QLIMEN_DOCCHECK_STATE") or os.path.join(
@@ -40,8 +42,10 @@ PATH_RE = re.compile(r"[^\s'\"`=()<>|;&,，：]*(?:TODO|交接|方案|索引)\.m
 DELIM = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
 SECTION = r"§([^\s，。；、（）()`→]+)"
 NUMERALS = "一二三四五六七八九十"
-ADVICE = ("处理办法（核心协议 §6）：历史（旧交接、做完的阶段、被替换的方案）挪进同目录 归档/，主文件留一行索引；"
+ADVICE = ("处理办法见核心协议 §6：TODO、记录不设字数上限，做完的段标「做完」留在原地，别为字数挪归档；"
           "表格一格只写一行；索引只写出处，引用要真实存在。改完告诉用户一句；这次不方便处理，就告诉用户原因。")
+MIGRATE = ("还有 交接.md（旧写法）：方便时照核心 §6 迁（停点进 TODO、历史进记录、还有效的规矩进方案「已定」），"
+           "迁完挪进 归档/；这次不方便就照旧写，不用为字数压缩")
 
 
 def wanted(path):
@@ -152,6 +156,20 @@ def index_problems(path, text):
     return probs
 
 
+def now_chars(text):
+    """TODO 最上面「## 现在」那一块有多少字（不算标题行，到下一个一、二级标题为止）；没有就是 0"""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if re.match(r"^##\s*现在", line):
+            body = []
+            for nxt in lines[i + 1:]:
+                if re.match(r"^#{1,2}\s", nxt):
+                    break
+                body.append(nxt)
+            return len("\n".join(body).strip())
+    return 0
+
+
 def problems(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -159,7 +177,15 @@ def problems(path):
     limit = INDEX_LIMIT if name in INDEX_NAMES else LIMITS.get(name)
     probs = []
     if limit and len(text) > limit:
-        probs.append("有 %d 字，超过上限 %d 字" % (len(text), limit))
+        if name == "方案.md":
+            probs.append("有 %d 字，超过约 %d 字：一批需求一份方案，拆成两批" % (len(text), limit))
+        else:
+            probs.append("有 %d 字，超过上限 %d 字" % (len(text), limit))
+    if name == "TODO.md" and now_chars(text) > NOW_LIMIT:
+        probs.append("「## 现在」有 %d 字，超过约 %d 字：多半在往里追加历史；只留停因、做到一半的、在跑的、先注意的，过程进记录"
+                     % (now_chars(text), NOW_LIMIT))
+    if name == "交接.md":
+        probs.append(MIGRATE)
     probs += table_problems(text, name == "TODO.md")
     if name in INDEX_NAMES:
         probs += index_problems(path, text)

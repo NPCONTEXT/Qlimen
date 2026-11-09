@@ -39,12 +39,12 @@ DSH_READER = os.path.join(HERE, 'dsh_read.mjs')
 
 MULTI_STEP = 5          # 多步回合：一个回合里工具调用 ≥ 5 次
 
-# 第 5 节「每条回复都以【进行中】或【已完成】开头」→ 首条带状态标记
-MARKS = ('【进行中】', '【已完成】')
+# 第 5 节「每条回复都以【施工】【等你】【收工】之一开头」→ 首条带状态标记（2026-11-04 前是【进行中】【已完成】，老会话照样认）
+MARKS = ('【施工】', '【等你】', '【收工】', '【进行中】', '【已完成】')
 
-# 第 6 节任务目录三件套的文件名
-TRIO = ('方案.md', 'TODO.md', '交接.md')
-RE_TRIO_NAME = re.compile(r'(方案|TODO|交接)\.md')
+# 第 6 节任务目录三件套的文件名（2026-11-04 起第三份是 记录.md；之前是 交接.md，老会话照样认）
+TRIO = ('方案.md', 'TODO.md', '记录.md', '交接.md')
+RE_TRIO_NAME = re.compile(r'(方案|TODO|记录|交接)\.md')
 
 # 第 2 节阶段预告「第几步/共几步」。
 # 窄 = 第 N 步、第 N/M 步、共 N 步；宽 = 再加 第 N/M 项、第一步（中文数字）、阶段 N / 步骤 N 后接冒号或「做完 / 完成 / 开始」、Step N/M、N/M 步。
@@ -92,12 +92,12 @@ RE_NOINT = re.compile(
     r'|(没法|无法|不能)(及时|主动)?(回复|回应|汇报)你?|没法主动汇报')
 
 # 用命令行改写三件套（重定向、tee、sed -i / perl -i 原地改）。Claude Code 和 DSH 的 Bash 调用用它。
-RE_SH_REDIR = re.compile(r'(?:>>?|\btee\b(?:\s+-a)?)\s*["\']?([^\s"\'<>|;&]*?(?:方案|TODO|交接)\.md)')
+RE_SH_REDIR = re.compile(r'(?:>>?|\btee\b(?:\s+-a)?)\s*["\']?([^\s"\'<>|;&]*?(?:方案|TODO|记录|交接)\.md)')
 RE_SH_INPLACE = re.compile(r'\b(?:sed|perl)\s+-i')
-RE_SH_NAME = re.compile(r'([^\s"\'<>|;&]*?(?:方案|TODO|交接)\.md)')
+RE_SH_NAME = re.compile(r'([^\s"\'<>|;&]*?(?:方案|TODO|记录|交接)\.md)')
 # Codex 的工具调用是一段段代码，读写分不开，只能从文本里猜写入（偏粗）。Python 的 open(...,'w') 写入识别不了。
 RE_CODEX_WRITE = re.compile(r'writeFile|apply_patch|\*\*\* (Update|Add) File|cat\s*>|>\s*\S+\.md')
-RE_CODEX_TRIO = re.compile(r'(\*\*\* (?:Update|Add) File:\s*|(?:cat|tee)\s*(?:-a\s*)?>?\s*|>\s*)(\S*?(?:方案|TODO|交接)\.md)')
+RE_CODEX_TRIO = re.compile(r'(\*\*\* (?:Update|Add) File:\s*|(?:cat|tee)\s*(?:-a\s*)?>?\s*|>\s*)(\S*?(?:方案|TODO|记录|交接)\.md)')
 
 # Qlimen 派工脚本发给工人的任务以这句开头（core/workers/工人守则*.md）。DSH 里有用户消息这样开头的会话是工人，整个不计。
 WORKER_HEAD = '【调度说明】'

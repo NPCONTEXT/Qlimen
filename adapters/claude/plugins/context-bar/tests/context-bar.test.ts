@@ -77,6 +77,9 @@ for (const trigger of ['manual', 'auto', 'precompute'] as const) {
     expect(ran).toMatchObject({ messages: [{ text: '摘要' }] })
     expect(told).toContain('简体中文')
     expect(told).toContain('压缩后提醒')
+    // 11-04：接手读什么只写在协议里，摘要要求只说「照协议」，不点名交接文件
+    expect(told).toContain('照协议接手')
+    expect(told).not.toMatch(/交接\.md|TODO\.md/)
     if (trigger === 'manual') expect(told).toContain('重点保留 GIF 工具的停点')
   })
 }
@@ -157,6 +160,10 @@ test('点按钮：发出交接请求；回复最后一行是「交接完成」�
   await ui.press({ key: 'handoff-confirm' })
   expect(sent).toHaveLength(1)
   expect(sent[0]).toContain('最后一行只写：交接完成')
+  // 11-04：交接写哪些文件只写在协议里，这句只说「照协议」；不开新活、不提问是插件要用的，留着
+  expect(sent[0]).toContain('照协议')
+  expect(sent[0]).toContain('不要向我提问')
+  expect(sent[0]).not.toMatch(/交接\.md|TODO\.md/)
   expect((await ui.find({ type: 'Text' }))?.text).toContain('交接中')
   expect(await ui.find({ key: 'handoff' })).toBeUndefined()
 
